@@ -7,6 +7,7 @@ Deps:   pip install PyQt5 requests
 
 import json
 import sys
+import threading
 import time
 
 import requests
@@ -66,7 +67,8 @@ class SubmitWorker(QThread):
     done = pyqtSignal()
 
     def __init__(self, cookies: dict, cfg: dict, targets: list, delay: float,
-                 answer_changes: str = "yes", answer_details: str = "yes"):
+                 answer_changes: str = "yes", answer_details: str = "yes",
+                 threads: int = 1):
         super().__init__()
         self.cookies = cookies
         self.cfg = cfg
@@ -74,34 +76,62 @@ class SubmitWorker(QThread):
         self.delay = delay
         self.answer_changes = answer_changes
         self.answer_details = answer_details
+        self.threads = max(1, int(threads))
         self._stop = False
 
     def stop(self):
         self._stop = True
 
     def run(self):
-        session = requests.Session()
-        for i, (row, cid, name) in enumerate(self.targets, 1):
-            if self._stop:
-                self.log.emit("Stopped by user.")
-                break
-            try:
-                code, tag, details, snippet = auto.submit_one(
-                    session, self.cookies, self.cfg, cid,
-                    self.answer_changes, self.answer_details)
-                label = f"{tag} ({details})" if details else tag
-                self.log.emit(
-                    f"[{i}/{len(self.targets)}] {label:<32} {cid} ({name}) http={code}"
-                )
-                self.progress.emit(row, cid, code, tag, details, snippet)
-                if tag == "AUTH_ERROR":
-                    self.log.emit("AUTH expired mid-run — refresh cookie and rescan.")
-                    break
-            except Exception as e:
-                self.log.emit(f"[{i}/{len(self.targets)}] EXC {cid} ({name}): {e}")
-                self.progress.emit(row, cid, 0, "EXC", "", str(e))
-            if i < len(self.targets):
-                time.sleep(self.delay)
+        total = len(self.targets)
+        queue = list(self.targets)
+        queue_lock = threading.Lock()
+        counter = [0]   # mutable shared counter for "[i/N]" log labels
+        auth_expired = threading.Event()
+
+        def worker_loop():
+            # Each worker owns its own requests.Session so connection
+            # pools don't get contested between threads.
+            session = requests.Session()
+            while True:
+                if self._stop or auth_expired.is_set():
+                    return
+                with queue_lock:
+                    if not queue:
+                        return
+                    row, cid, name = queue.pop(0)
+                    counter[0] += 1
+                    i = counter[0]
+
+                try:
+                    code, tag, details, snippet = auto.submit_one(
+                        session, self.cookies, self.cfg, cid,
+                        self.answer_changes, self.answer_details)
+                    label = f"{tag} ({details})" if details else tag
+                    self.log.emit(
+                        f"[{i}/{total}] {label:<32} {cid} ({name}) http={code}"
+                    )
+                    self.progress.emit(row, cid, code, tag, details, snippet)
+                    if tag == "AUTH_ERROR":
+                        self.log.emit("AUTH expired — stopping all threads. Refresh cookie and rescan.")
+                        auth_expired.set()
+                        return
+                except Exception as e:
+                    self.log.emit(f"[{i}/{total}] EXC {cid} ({name}): {e}")
+                    self.progress.emit(row, cid, 0, "EXC", "", str(e))
+
+                if self.delay > 0:
+                    time.sleep(self.delay)
+
+        self.log.emit(f"Spawning {self.threads} worker thread(s)...")
+        pool = [threading.Thread(target=worker_loop, daemon=True)
+                for _ in range(self.threads)]
+        for t in pool:
+            t.start()
+        for t in pool:
+            t.join()
+        if self._stop:
+            self.log.emit("Stopped by user.")
         self.done.emit()
 
 
@@ -234,6 +264,17 @@ class MainWindow(QMainWindow):
         self.delay_spin.setValue(1.5)
         self.delay_spin.setFixedWidth(70)
         row2.addWidget(self.delay_spin)
+
+        row2.addWidget(QLabel("threads:"))
+        self.threads_spin = QSpinBox()
+        self.threads_spin.setRange(1, 20)
+        self.threads_spin.setValue(1)
+        self.threads_spin.setFixedWidth(50)
+        self.threads_spin.setToolTip(
+            "Parallel workers. Throughput ≈ threads / delay submits/sec.\n"
+            "Higher values risk Google rate-limiting; 3–5 is usually safe."
+        )
+        row2.addWidget(self.threads_spin)
 
         self.skip_done_chk = QCheckBox("Skip already submitted (OK/PENDING)")
         self.skip_done_chk.setChecked(True)
@@ -496,15 +537,17 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Empty", "No rows checked.")
             return
         delay = self.delay_spin.value()
-        eta = len(targets) * delay / 60
+        threads = self.threads_spin.value()
+        eta = len(targets) * delay / 60 / max(1, threads)
         ans = QMessageBox.question(
             self, "Confirm",
-            f"Submit appeals for {len(targets)} accounts? (~{eta:.1f} min)",
+            f"Submit appeals for {len(targets)} accounts "
+            f"with {threads} thread(s)?  (~{eta:.1f} min)",
         )
         if ans != QMessageBox.Yes:
             return
 
-        self.append_log(f"--- Submitting {len(targets)} appeals ---")
+        self.append_log(f"--- Submitting {len(targets)} appeals ({threads} threads) ---")
         self.btn_submit.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.btn_scan.setEnabled(False)
@@ -514,7 +557,7 @@ class MainWindow(QMainWindow):
         self.append_log(f"Answers — changes={ans_changes!r}  details={ans_details!r}")
         self.submit_worker = SubmitWorker(
             self.cookies, self.cfg, targets, delay,
-            ans_changes, ans_details,
+            ans_changes, ans_details, threads,
         )
         self.submit_worker.log.connect(self.append_log)
         self.submit_worker.progress.connect(self.on_submit_progress)
