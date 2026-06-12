@@ -1,0 +1,30 @@
+# Secrets — NEVER commit
+cookie.txt
+*.cookies
+.env
+
+# Runtime data
+appeal_results.json
+diagnostics_raw/
+overview.html
+accounts*.json
+suspended.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

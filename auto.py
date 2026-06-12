@@ -1,0 +1,448 @@
+"""
+AdsCancel — one-shot bulk re-appeal for Google Ads MCC sub-accounts
+that were suspended for "Circumventing systems: Multiple account abuse".
+
+Workflow (single command):
+    1. Read cookie.txt (paste from a logged-in browser).
+    2. Auto-discover __u / __c / __lu / manager_customer_id / f.sid / xsrf
+       by fetching https://ads.google.com/aw/accounts.
+    3. List every sub-account under the user's default MCC.
+    4. Filter to leaves with ui_account_status == 2 and a descriptive_name
+       starting with "MCC_Child_" (the Multi-account-abuse cohort).
+    5. POST AccountSuspensionAppealService.Submit for each one.
+    6. Log results to appeal_results.json.
+
+Usage:
+    python auto.py                 # do everything, with prompt
+    python auto.py --yes           # skip prompt
+    python auto.py --dry-run       # show what would be sent, no POST
+    python auto.py --limit 5       # process only first 5 (smoke test)
+    python auto.py --ids ID1,ID2   # target specific customer IDs
+"""
+
+import argparse
+import collections
+import http.cookiejar
+import json
+import re
+import sys
+import time
+from html import unescape
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse
+
+import requests
+
+# --- knobs ----------------------------------------------------------------
+
+NAME_PREFIX = "MCC_Child_"   # naming pattern of the abuse-suspended cohort
+STATUS_TARGET = 2            # ui_account_status: 2 = policy/abuse-suspended
+
+APPEAL_ABUSE_TAG_IDS_PRIMARY   = [288]   # __ar.1.9
+APPEAL_ABUSE_TAG_IDS_SECONDARY = [59]    # __ar.1.13
+
+DEFAULT_DELAY = 1.5
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+ACCOUNTS_URL_TMPL = "https://ads.google.com/aw/accounts?authuser={authuser}"
+
+
+def data_dir() -> Path:
+    """Where cookie.txt and appeal_results.json live.
+
+    When running from source -> next to the script (familiar).
+    When frozen by PyInstaller into a .app -> ~/.adscancel/ so the user can
+    still edit cookie.txt and the app can write the results file."""
+    if getattr(sys, "frozen", False):
+        d = Path.home() / ".adscancel"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    return Path(__file__).resolve().parent
+
+# --- cookie / xssi helpers -----------------------------------------------
+
+def strip_xssi(s: str) -> str:
+    return s.lstrip(")]}\n' \r\t")
+
+
+def load_cookies(path: Path) -> dict:
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        sys.exit(f"cookie.txt is empty: {path}")
+    if text.lstrip().startswith("#") or "\tTRUE\t" in text or "\tFALSE\t" in text:
+        jar = http.cookiejar.MozillaCookieJar()
+        jar.load(str(path), ignore_discard=True, ignore_expires=True)
+        return {c.name: c.value for c in jar}
+    cookies = {}
+    for part in text.replace("\n", ";").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        cookies[k.strip()] = v.strip()
+    return cookies
+
+
+# --- session discovery ----------------------------------------------------
+
+def discover_session(session: requests.Session, cookies: dict, authuser: str) -> dict:
+    """Two-stage discovery:
+       (a) GET /aw/accounts with a minimal UA. Google's browser-check
+           redirects to /aw/browser_not_supported?ocid=...&__u=... — that
+           URL exposes every per-user ID we need plus an f.sid.
+       (b) GET /aw/accounts with a real Chrome UA + ocid. The HTML embeds
+           the XSRF token used by all RPC calls."""
+
+    # --- (a) IDs + f.sid from the browser-check redirect URL ---
+    r1 = session.get(ACCOUNTS_URL_TMPL.format(authuser=authuser),
+                     headers={"user-agent": "Mozilla/5.0", "accept": "text/html"},
+                     cookies=cookies, allow_redirects=True, timeout=30)
+    if "accounts.google.com/" in r1.url and "/signin/" in r1.url:
+        sys.exit("Cookie expired — got redirected to sign-in. Refresh cookie.txt.")
+
+    qs = parse_qs(urlparse(r1.url).query)
+    def first(key): return qs.get(key, [""])[0]
+    ocid, euid, uu, uc = first("ocid"), first("euid"), first("__u"), first("__c")
+    fsid = first("f.sid")
+    if not (ocid and uu and uc):
+        sys.exit(f"Could not extract IDs from redirect URL: {r1.url}")
+    if not fsid:
+        sys.exit(f"Could not extract f.sid from redirect URL: {r1.url}")
+
+    # --- (b) XSRF token from the real page HTML ---
+    real_url = (f"https://ads.google.com/aw/accounts?ocid={ocid}"
+                f"&euid={euid}&__u={uu}&__c={uc}&authuser={authuser}")
+    r2 = session.get(real_url, headers={"user-agent": UA, "accept": "text/html"},
+                     cookies=cookies, allow_redirects=True, timeout=30)
+    m_xsrf = re.search(r"(AA[A-Za-z0-9_\-]{24,}:\d{13})", r2.text)
+    if not m_xsrf:
+        sys.exit("Could not extract XSRF token from accounts page HTML.")
+
+    return {
+        "manager_customer_id": ocid,
+        "login_user_id":       euid or uu,
+        "user_id":              uu,
+        "customer_id":          uc,
+        "f_sid":                fsid,
+        "xsrf_token":           m_xsrf.group(1),
+        "authuser":             authuser,
+    }
+
+
+# --- list accounts --------------------------------------------------------
+
+LIST_URL_TMPL = (
+    "https://ads.google.com/aw_mcc/_/rpc/AccountService/List"
+    "?authuser={authuser}&xt=awn"
+    "&rpcTrackingId=AccountService.List%3A2"
+    "&f.sid={fsid}"
+)
+
+LIST_FIELDS = [
+    "customer_info.ui_account_status",
+    "customer_info.is_hidden",
+    "customer_info.descriptive_name",
+    "customer_info.is_manager",
+    "customer_id",
+    "customer_info.external_customer_id",
+    "customer_manager_info.manager_customer_id",
+    "customer_manager_info.level",
+    "customer_manager_info.in_authorized_customer_hierarchy",
+    "currency_code",
+]
+
+
+def list_accounts(session: requests.Session, cookies: dict, cfg: dict) -> list[dict]:
+    url = LIST_URL_TMPL.format(authuser=cfg["authuser"], fsid=cfg["f_sid"])
+    headers = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/x-www-form-urlencoded",
+        "origin": "https://ads.google.com",
+        "referer": f"https://ads.google.com/aw/accounts?ocid={cfg['manager_customer_id']}&authuser={cfg['authuser']}",
+        "user-agent": UA,
+        "x-framework-xsrf-token": cfg["xsrf_token"],
+        "x-same-domain": "1",
+    }
+    ar = {
+        "1": {
+            "3": {"1": cfg["manager_customer_id"]},
+            "5": "TABLE_TWO_STAGE_RPC",
+            "6": "32400000",
+        },
+        "2": {
+            "1": LIST_FIELDS,
+            "2": [
+                {"1": "customer_info.status", "2": 3,
+                 "4": [{"3": str(s)} for s in (1, 2, 3, 4, 5)]},
+                {"1": "customer_info.is_hidden", "2": 1, "4": [{"1": False}]},
+                {"1": "customer_manager_info.manager_customer_id", "2": 1,
+                 "4": [{"3": cfg["manager_customer_id"]}]},
+                {"1": "customer_manager_info.level", "2": 1, "4": [{"3": "1"}]},
+                {"1": "customer_manager_info.in_authorized_customer_hierarchy", "2": 1,
+                 "4": [{"1": True}]},
+            ],
+            "3": [
+                {"1": "customer_info.is_manager", "2": 2},
+                {"1": "customer_info.descriptive_name", "2": 1},
+                {"1": "customer_info.external_customer_id", "2": 1},
+            ],
+            "14": True,
+        },
+    }
+    body = {
+        "hl": "en_US",
+        "__lu": cfg["login_user_id"],
+        "__u":  cfg["user_id"],
+        "__c":  cfg["customer_id"],
+        "f.sid": cfg["f_sid"],
+        "ps": "aw",
+        "__ar": json.dumps(ar, separators=(",", ":")),
+        "activityContext": "AccountSecondaryRpc",
+        "requestPriority":  "HIGH_LATENCY_SENSITIVE",
+        "activityType":     "USER_NON_BLOCKING",
+        "activityId":       "747129126721226",
+        "uniqueFingerprint": f"{cfg['f_sid']}_747129126721226_1",
+        "destinationPlace": "/aw/accounts",
+    }
+    r = session.post(url, headers=headers, cookies=cookies,
+                     data=urlencode(body), timeout=60)
+    if r.status_code != 200:
+        sys.exit(f"List HTTP {r.status_code}\n{r.text[:600]}")
+    data = json.loads(strip_xssi(r.text))
+    # Error responses surface inside data["5"]["2"] (a list of error objects).
+    errs = data.get("5", {}).get("2") if isinstance(data.get("5"), dict) else None
+    if errs and "1" not in data:
+        sys.exit(f"List API error:\n{json.dumps(errs, indent=2)[:800]}")
+    out = []
+    for raw in data.get("1", []):
+        info = raw.get("3", {})
+        out.append({
+            "customer_id":          raw.get("1"),
+            "descriptive_name":     info.get("2"),
+            "external_customer_id": info.get("5"),
+            "is_manager":           info.get("7", False),
+            "is_hidden":            info.get("8", False),
+            "ui_account_status":    info.get("32"),
+        })
+    return out
+
+
+# --- submit appeal --------------------------------------------------------
+
+APPEAL_URL_TMPL = (
+    "https://ads.google.com/ga/_/AwSupportPlatform/_/rpc/"
+    "AccountSuspensionAppealService/Submit"
+    "?authuser={authuser}&xt=awn"
+    "&rpcTrackingId=AccountSuspensionAppealService.Submit%3A1"
+    "&f.sid={fsid}"
+)
+
+
+def appeal_headers(cfg: dict, customer_id: str) -> dict:
+    return {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/x-www-form-urlencoded",
+        "origin": "https://ads.google.com",
+        "referer": (
+            f"https://ads.google.com/aw/overview?ocid={customer_id}"
+            f"&euid={cfg['login_user_id']}&__u={cfg['user_id']}"
+            f"&uscid={cfg['manager_customer_id']}&__c={cfg['customer_id']}"
+            f"&authuser={cfg['authuser']}"
+        ),
+        "user-agent": UA,
+        "x-framework-xsrf-token": cfg["xsrf_token"],
+        "x-same-domain": "1",
+    }
+
+
+def appeal_body(cfg: dict, customer_id: str,
+                answer_changes: str = "yes",
+                answer_details: str = "yes") -> str:
+    ar = {
+        "1": {
+            "1": str(customer_id),
+            "2": "-1",
+            "4": 2,
+            "9": APPEAL_ABUSE_TAG_IDS_PRIMARY,
+            "13": APPEAL_ABUSE_TAG_IDS_SECONDARY,
+        },
+        "2": [
+            {
+                "1": "inputChangesFromLastAppeal",
+                "2": "What changes have you made to your account or payments since the last appeal?",
+                "3": answer_changes,
+            },
+            {
+                "1": "inputFurtherDetailsSinceLastAppeal",
+                "2": "Is there any other info that wasn't included in the last appeal?",
+                "3": answer_details,
+            },
+        ],
+    }
+    return urlencode({
+        "hl": "en_US",
+        "__lu": cfg["login_user_id"],
+        "__u":  cfg["user_id"],
+        "__c":  cfg["customer_id"],
+        "f.sid": cfg["f_sid"],
+        "ps": "aw",
+        "__ar": json.dumps(ar, separators=(",", ":")),
+        "activityContext": "AccountAppealFormSlidealog.AccountAppealFormStepper.Submit",
+        "requestPriority":  "HIGH_LATENCY_SENSITIVE",
+        "activityType":     "INTERACTIVE",
+        "activityId":       "475126922029082",
+        "uniqueFingerprint": f"{cfg['f_sid']}_475126922029082_1",
+        "previousPlace":    "/aw/overview",
+        "activityName":     "AccountAppealFormSlidealog.AccountAppealFormStepper.Submit",
+        "destinationPlace": "/aw/overview",
+    })
+
+
+_ERROR_CODE_RX = re.compile(
+    r'"3":"([A-Z][A-Z0-9_]{4,}(?:_ERROR_[A-Z0-9_]+|ERROR[A-Z0-9_]*))"'
+)
+
+
+def classify(http_status: int, body: str) -> tuple[str, str]:
+    """Return (primary_tag, full_details).
+
+    primary_tag picks the most informative single label for coloring.
+    full_details lists every error code found in the response so the UI can
+    show all of them when one submit triggers multiple errors at once."""
+    if http_status != 200:
+        return f"HTTP{http_status}", ""
+    cleaned = strip_xssi(body)
+
+    codes = sorted(set(_ERROR_CODE_RX.findall(cleaned)))
+    if not codes:
+        if "An error occurred" in cleaned:
+            return "ERROR", ""
+        return "OK", ""
+
+    # Short-name each code so the tag cell stays scannable. Example:
+    #   FIELD_ERROR_VALUE_BLACKLISTED -> BLACKLISTED
+    #   ACCOUNT_APPEAL_ERROR_PENDING  -> PENDING
+    #   AUTH_ERROR_AUTHENTICATION_FAILED -> AUTH_ERROR
+    def short(code: str) -> str:
+        if "BLACKLISTED" in code: return "BLACKLISTED"
+        if "PENDING"     in code: return "PENDING"
+        if "AUTH"        in code: return "AUTH_ERROR"
+        return code
+
+    short_tags = []
+    for c in codes:
+        s = short(c)
+        if s not in short_tags:
+            short_tags.append(s)
+
+    # Pick a single primary tag for the row's color (priority order).
+    priority = ["AUTH_ERROR", "BLACKLISTED", "PENDING", "ERROR"]
+    primary = next((p for p in priority if p in short_tags), short_tags[0])
+    details = " + ".join(short_tags) if len(short_tags) > 1 else ""
+    return primary, details
+
+
+def submit_one(session: requests.Session, cookies: dict, cfg: dict, customer_id: str,
+               answer_changes: str = "yes", answer_details: str = "yes"):
+    url = APPEAL_URL_TMPL.format(authuser=cfg["authuser"], fsid=cfg["f_sid"])
+    r = session.post(url, headers=appeal_headers(cfg, customer_id),
+                     cookies=cookies,
+                     data=appeal_body(cfg, customer_id, answer_changes, answer_details),
+                     timeout=30)
+    tag, details = classify(r.status_code, r.text)
+    return r.status_code, tag, details, r.text[:280].replace("\n", " ")
+
+
+# --- main -----------------------------------------------------------------
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--delay", type=float, default=DEFAULT_DELAY)
+    p.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+    p.add_argument("--name-prefix", default=NAME_PREFIX)
+    p.add_argument("--status", type=int, default=STATUS_TARGET)
+    p.add_argument("--ids", default="", help="Comma-separated customer IDs (skip listing)")
+    p.add_argument("--authuser", default="0")
+    p.add_argument("--answer-changes", default="yes",
+                   help="Reply to 'What changes have you made...?'")
+    p.add_argument("--answer-details", default="yes",
+                   help="Reply to 'Is there any other info...?'")
+    args = p.parse_args()
+
+    here = data_dir()
+    cookies = load_cookies(here / "cookie.txt")
+    session = requests.Session()
+
+    print("Step 1/3  Discovering session from cookies...")
+    cfg = discover_session(session, cookies, args.authuser)
+    print(f"  MCC={cfg['manager_customer_id']}  __u={cfg['user_id']}  "
+          f"__c={cfg['customer_id']}  f.sid={cfg['f_sid']}")
+
+    if args.ids:
+        targets = [{"customer_id": x.strip(), "descriptive_name": "(from --ids)"}
+                   for x in args.ids.split(",") if x.strip()]
+        print(f"\nStep 2/3  Using {len(targets)} explicit IDs (skipping list)")
+    else:
+        print("\nStep 2/3  Listing accounts + filtering...")
+        accounts = list_accounts(session, cookies, cfg)
+        by_status = collections.Counter(a["ui_account_status"] for a in accounts)
+        print(f"  Got {len(accounts)} accounts. status distribution: {dict(by_status)}")
+        targets = [a for a in accounts
+                   if not a["is_manager"]
+                   and a["ui_account_status"] == args.status
+                   and (a["descriptive_name"] or "").startswith(args.name_prefix)]
+        print(f"  {len(targets)} target accounts "
+              f"(status={args.status}, name prefix {args.name_prefix!r})")
+
+    if args.limit:
+        targets = targets[: args.limit]
+    if not targets:
+        sys.exit("Nothing to do.")
+
+    if not args.dry_run and not args.yes:
+        eta = len(targets) * args.delay / 60
+        ans = input(f"\nSubmit appeals for {len(targets)} accounts? "
+                    f"(~{eta:.1f} min) [y/N] ").strip().lower()
+        if ans not in ("y", "yes"):
+            sys.exit("Aborted.")
+
+    print(f"\nStep 3/3  Submitting (delay={args.delay}s)...")
+    results = []
+    for i, acc in enumerate(targets, 1):
+        cid = str(acc["customer_id"])
+        name = acc.get("descriptive_name", "")
+        if args.dry_run:
+            print(f"[{i}/{len(targets)}] DRY {cid}  ({name})")
+            results.append({"customer_id": cid, "name": name, "tag": "dry-run"})
+            continue
+        try:
+            code, tag, details, snippet = submit_one(
+                session, cookies, cfg, cid,
+                args.answer_changes, args.answer_details)
+            label = f"{tag} ({details})" if details else tag
+            print(f"[{i}/{len(targets)}] {label:<32} {cid}  ({name})  http={code}")
+            results.append({"customer_id": cid, "name": name,
+                            "http": code, "tag": tag, "details": details,
+                            "body": snippet})
+            if tag == "AUTH_ERROR":
+                print("\nAUTH expired mid-run — refresh cookie.txt and rerun.")
+                break
+        except Exception as e:
+            print(f"[{i}/{len(targets)}] EXC         {cid}  ({name})  {e}")
+            results.append({"customer_id": cid, "name": name, "error": str(e)})
+        if i < len(targets):
+            time.sleep(args.delay)
+
+    out = data_dir() / "appeal_results.json"
+    out.write_text(json.dumps(results, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    counts = collections.Counter(r.get("tag", "?") for r in results)
+    print(f"\nDone. Log -> {out}\nSummary: {dict(counts)}")
+
+
+if __name__ == "__main__":
+    main()
