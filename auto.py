@@ -493,12 +493,21 @@ def main() -> None:
         accounts = list_accounts(session, cookies, cfg)
         by_status = collections.Counter(a["ui_account_status"] for a in accounts)
         print(f"  Got {len(accounts)} accounts. status distribution: {dict(by_status)}")
-        targets = [a for a in accounts
-                   if not a["is_manager"]
-                   and a["ui_account_status"] == args.status
-                   and (a["descriptive_name"] or "").startswith(args.name_prefix)]
-        print(f"  {len(targets)} target accounts "
-              f"(status={args.status}, name prefix {args.name_prefix!r})")
+
+        # Single-account fallback: list_accounts already added a synthetic
+        # "(your account)" row when the user isn't an MCC owner. Skip the
+        # MCC_Child cohort filter and target it directly.
+        if (len(accounts) == 1
+                and accounts[0].get("descriptive_name") == "(your account)"):
+            targets = list(accounts)
+            print(f"  Single-account mode: targeting {targets[0]['customer_id']}")
+        else:
+            targets = [a for a in accounts
+                       if not a["is_manager"]
+                       and a["ui_account_status"] == args.status
+                       and (a["descriptive_name"] or "").startswith(args.name_prefix)]
+            print(f"  {len(targets)} target accounts "
+                  f"(status={args.status}, name prefix {args.name_prefix!r})")
 
     if args.limit:
         targets = targets[: args.limit]
