@@ -269,8 +269,9 @@ class MainWindow(QMainWindow):
         # Filter row
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Filter prefix:"))
-        self.prefix_edit = QLineEdit("MCC_Child_")
-        self.prefix_edit.setFixedWidth(140)
+        self.prefix_edit = QLineEdit()   # empty by default — name-prefix filtering off
+        self.prefix_edit.setPlaceholderText("e.g. MCC_Child_  (leave empty for all)")
+        self.prefix_edit.setFixedWidth(180)
         row2.addWidget(self.prefix_edit)
 
         row2.addWidget(QLabel("ui_account_status:"))
@@ -509,17 +510,26 @@ class MainWindow(QMainWindow):
         self.accounts = accounts
         self._populate_table(accounts)
 
-        # Single-account fallback: only one row and it's the synthetic
-        # "(your account)" entry. Skip the MCC_Child prefix filter — there's
-        # no cohort to filter, just tick the single row.
-        if len(accounts) == 1 and accounts[0].get("descriptive_name") == "(your account)":
-            self.table.cellWidget(0, 0).setChecked(True)
-            self.append_log(
+        # Single-account fallback: synthetic "(your account)" entries from
+        # auto.list_accounts. Tick the primary one (and optionally the alt id).
+        single_rows = [
+            i for i, a in enumerate(accounts)
+            if (a.get("descriptive_name") or "").startswith("(your account)")
+        ]
+        if single_rows and len(single_rows) == len(accounts):
+            self.table.cellWidget(single_rows[0], 0).setChecked(True)
+            msg = (
                 "Single-account mode: no MCC sub-accounts found. "
-                "The discovered customer was added as the sole target."
+                "Primary customer (__c) added as target."
             )
+            if len(single_rows) > 1:
+                msg += (
+                    f" Alt ID (ocid) also listed — if the first one returns "
+                    f"ENTITY_DOES_NOT_EXIST, untick row 1 and tick row 2."
+                )
+            self.append_log(msg)
             self.statusBar().showMessage(
-                "Single account ready. Click Submit to re-appeal it."
+                "Single account ready. Click Submit to re-appeal."
             )
         else:
             self.apply_filter()

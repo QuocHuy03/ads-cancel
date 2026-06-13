@@ -35,7 +35,7 @@ import requests
 
 # --- knobs ----------------------------------------------------------------
 
-NAME_PREFIX = "MCC_Child_"   # naming pattern of the abuse-suspended cohort
+NAME_PREFIX = ""             # empty = no name filter (default tick everything)
 STATUS_TARGET = 2            # ui_account_status: 2 = policy/abuse-suspended
 
 APPEAL_ABUSE_TAG_IDS_PRIMARY   = [288]   # __ar.1.9
@@ -313,18 +313,32 @@ def list_accounts(session: requests.Session, cookies: dict, cfg: dict) -> list[d
         })
 
     # Single-account fallback: the signed-in user isn't an MCC owner, so the
-    # manager-scoped list above returned nothing. Treat their own discovered
-    # customer (cfg.manager_customer_id) as the sole row in the table so the
-    # UI can still tick + submit it.
+    # manager-scoped list above returned nothing. Use cfg["customer_id"]
+    # (the __c value) because that's the real Google Ads customer behind the
+    # session. cfg["manager_customer_id"] (ocid) is often a navigation /
+    # workspace placeholder that the appeal endpoint rejects as ENTITY_DOES_NOT_EXIST.
     if not out:
+        cid = cfg["customer_id"] or cfg["manager_customer_id"]
         out.append({
-            "customer_id":          cfg["manager_customer_id"],
+            "customer_id":          cid,
             "descriptive_name":     "(your account)",
             "external_customer_id": "",
             "is_manager":           False,
             "is_hidden":            False,
-            "ui_account_status":    None,  # unknown — we didn't get status info
+            "ui_account_status":    None,
         })
+        # If ocid differs, expose it as a second candidate row so the user
+        # can try it manually if the first one doesn't work.
+        if (cfg["manager_customer_id"]
+                and cfg["manager_customer_id"] != cid):
+            out.append({
+                "customer_id":          cfg["manager_customer_id"],
+                "descriptive_name":     "(your account — alt ID)",
+                "external_customer_id": "",
+                "is_manager":           False,
+                "is_hidden":            False,
+                "ui_account_status":    None,
+            })
     return out
 
 
@@ -494,13 +508,18 @@ def main() -> None:
         by_status = collections.Counter(a["ui_account_status"] for a in accounts)
         print(f"  Got {len(accounts)} accounts. status distribution: {dict(by_status)}")
 
-        # Single-account fallback: list_accounts already added a synthetic
-        # "(your account)" row when the user isn't an MCC owner. Skip the
-        # MCC_Child cohort filter and target it directly.
-        if (len(accounts) == 1
-                and accounts[0].get("descriptive_name") == "(your account)"):
-            targets = list(accounts)
+        # Single-account fallback: list_accounts added synthetic "(your account)"
+        # rows when the user isn't an MCC owner. Skip the MCC_Child cohort
+        # filter and target the first one (__c). The second row (ocid) is a
+        # backup for when __c returns ENTITY_DOES_NOT_EXIST.
+        single = [a for a in accounts
+                  if (a.get("descriptive_name") or "").startswith("(your account)")]
+        if single and len(single) == len(accounts):
+            targets = single[:1]
             print(f"  Single-account mode: targeting {targets[0]['customer_id']}")
+            if len(single) > 1:
+                print(f"  (alt ID {single[1]['customer_id']} also available — "
+                      "use --ids to try if the first fails)")
         else:
             targets = [a for a in accounts
                        if not a["is_manager"]
