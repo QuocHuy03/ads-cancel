@@ -426,9 +426,9 @@ class MainWindow(QMainWindow):
             self.append_log(f"Failed to read appeal_results.json: {e}")
 
     def save_cookie(self):
-        """Merge pasted cookies with whatever's already in cookie.txt so that
-        persistent values (SID, HSID, APISID, SAPISID, SSID, __Secure-*PSID...)
-        survive when the user only pastes the rotating bits (SIDCC, SIDTS)."""
+        """Save the pasted cookies, merging with what's already on disk
+        WHEN it's the same Google account (only rotating bits changed) and
+        REPLACING when the user has switched to a different account."""
         text = self.cookie_edit.toPlainText().strip()
         if not text:
             QMessageBox.warning(self, "Empty", "Cookie textarea is empty.")
@@ -445,21 +445,31 @@ class MainWindow(QMainWindow):
 
         existing = parse(COOKIE_FILE.read_text(encoding="utf-8")) if COOKIE_FILE.exists() else {}
         new = parse(text)
-        merged = {**existing, **new}   # new values override stale ones for same key
 
-        # Persist as single-line "k=v; k=v" (auto.load_cookies handles it).
+        # Identity fingerprint: __Secure-1PSID (or fallback SID) encodes the
+        # Google account. If it changed, user switched accounts and we must
+        # replace — merging would mix cookies from two accounts and break auth.
+        def fp(d): return d.get("__Secure-1PSID") or d.get("SID") or ""
+        same_account = (not existing) or (fp(new) and fp(existing) and fp(new) == fp(existing))
+
+        if same_account:
+            merged = {**existing, **new}
+            mode = "merged (same account, rotating cookies refreshed)"
+        else:
+            merged = new
+            mode = "REPLACED (different account detected — replaced wholesale)"
+
         COOKIE_FILE.write_text("; ".join(f"{k}={v}" for k, v in merged.items()),
                                encoding="utf-8")
         self.cookies = merged
+        # Reflect the canonical state in the textarea too.
+        self.cookie_edit.setPlainText(COOKIE_FILE.read_text(encoding="utf-8").strip())
 
         added = sorted(set(new) - set(existing))
         updated = sorted(set(new) & set(existing))
-        self.append_log(
-            f"Cookie merged: {len(merged)} total "
-            f"(+{len(added)} new, {len(updated)} refreshed)"
-        )
+        self.append_log(f"Cookie {mode}: {len(merged)} total  (+{len(added)} new, {len(updated)} refreshed)")
         self.statusBar().showMessage(
-            f"Cookie ready ({len(merged)} keys; refreshed: {len(updated)})"
+            f"Cookie ready ({len(merged)} keys)  —  {mode}"
         )
 
         critical = ["SID", "HSID", "APISID", "SAPISID",
@@ -470,7 +480,8 @@ class MainWindow(QMainWindow):
                 self, "Missing cookies",
                 "These critical cookies are missing — auth will likely fail:\n\n"
                 + ", ".join(missing) +
-                "\n\nPaste the full Cookie header value from DevTools."
+                "\n\nPaste the FULL Cookie header value from DevTools "
+                "(F12 → Network → click a request → Headers → Cookie:)."
             )
 
     def scan(self):
