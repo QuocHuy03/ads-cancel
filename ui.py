@@ -350,6 +350,8 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setWordWrap(True)
         self.table.verticalHeader().setDefaultSectionSize(36)
+        # Click the "✓" header cell to toggle every row's checkbox.
+        self.table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -379,8 +381,13 @@ class MainWindow(QMainWindow):
         self.btn_uncheck_all.clicked.connect(lambda: self._set_all_checked(False))
         row3.addWidget(self.btn_uncheck_all)
 
+        self.btn_invert = QPushButton("Invert")
+        self.btn_invert.setToolTip("Flip every row's tick state.")
+        self.btn_invert.clicked.connect(self._invert_checked)
+        row3.addWidget(self.btn_invert)
+
         row3.addStretch()
-        self.summary_lbl = QLabel("0 selected")
+        self.summary_lbl = QLabel("0 / 0 selected")
         row3.addWidget(self.summary_lbl)
 
         self.btn_submit = QPushButton("Submit appeals for checked")
@@ -675,10 +682,28 @@ class MainWindow(QMainWindow):
         for r in range(self.table.rowCount()):
             self.table.cellWidget(r, 0).setChecked(v)
 
+    def _invert_checked(self):
+        for r in range(self.table.rowCount()):
+            box = self.table.cellWidget(r, 0)
+            box.setChecked(not box.isChecked())
+
+    def _on_header_clicked(self, col: int):
+        # Click the "✓" column header to toggle every row.
+        if col != 0:
+            return
+        total = self.table.rowCount()
+        if total == 0:
+            return
+        checked = sum(1 for r in range(total)
+                      if self.table.cellWidget(r, 0).isChecked())
+        # All ticked already → untick all; otherwise tick all.
+        self._set_all_checked(checked != total)
+
     def _update_summary(self):
-        n = sum(1 for r in range(self.table.rowCount())
+        total = self.table.rowCount()
+        n = sum(1 for r in range(total)
                 if self.table.cellWidget(r, 0).isChecked())
-        self.summary_lbl.setText(f"{n} selected")
+        self.summary_lbl.setText(f"{n} / {total} selected")
 
     def submit_checked(self):
         if not self.cfg:
