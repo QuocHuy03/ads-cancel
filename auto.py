@@ -85,13 +85,19 @@ def load_cookies(path: Path) -> dict:
 
 # --- session discovery ----------------------------------------------------
 
-def discover_session(session: requests.Session, cookies: dict, authuser: str) -> dict:
+def discover_session(session: requests.Session, cookies: dict, authuser: str,
+                     forced_ocid: str = "") -> dict:
     """Two-stage discovery:
        (a) GET /aw/accounts with a minimal UA. Google's browser-check
            redirects to /aw/browser_not_supported?ocid=...&__u=... — that
            URL exposes every per-user ID we need plus an f.sid.
        (b) GET /aw/accounts with a real Chrome UA + ocid. The HTML embeds
-           the XSRF token used by all RPC calls."""
+           the XSRF token used by all RPC calls.
+
+    If the user has multiple MCCs Google redirects to /nav/selectaccount
+    instead. In that case we parse the HTML for the available ocids and
+    re-request with an explicit one (forced_ocid if given, else the first
+    one found)."""
 
     # --- (a) IDs + f.sid from the browser-check redirect URL ---
     r1 = session.get(ACCOUNTS_URL_TMPL.format(authuser=authuser),
@@ -104,6 +110,32 @@ def discover_session(session: requests.Session, cookies: dict, authuser: str) ->
     def first(key): return qs.get(key, [""])[0]
     ocid, euid, uu, uc = first("ocid"), first("euid"), first("__u"), first("__c")
     fsid = first("f.sid")
+
+    # Multi-account case: Google parks us at /nav/selectaccount until a pick.
+    if "/nav/selectaccount" in r1.url or not ocid:
+        ocids = sorted(set(re.findall(r"ocid=(\d{6,12})", r1.text)))
+        if forced_ocid:
+            pick = forced_ocid
+        elif ocids:
+            pick = ocids[0]
+        else:
+            sys.exit(
+                f"Got {r1.url} but couldn't find any MCC IDs in the page. "
+                "You may need to pick one manually."
+            )
+        # Retry with an explicit ocid to skip the picker.
+        r1 = session.get(
+            f"https://ads.google.com/aw/accounts?ocid={pick}&authuser={authuser}",
+            headers={"user-agent": "Mozilla/5.0", "accept": "text/html"},
+            cookies=cookies, allow_redirects=True, timeout=30,
+        )
+        qs = parse_qs(urlparse(r1.url).query)
+        ocid = first("ocid") or pick
+        euid = first("euid") or euid
+        uu   = first("__u")  or uu
+        uc   = first("__c")  or uc
+        fsid = first("f.sid") or fsid
+
     if not (ocid and uu and uc):
         sys.exit(f"Could not extract IDs from redirect URL: {r1.url}")
     if not fsid:
@@ -367,6 +399,8 @@ def main() -> None:
     p.add_argument("--status", type=int, default=STATUS_TARGET)
     p.add_argument("--ids", default="", help="Comma-separated customer IDs (skip listing)")
     p.add_argument("--authuser", default="0")
+    p.add_argument("--mcc", default="",
+                   help="Force a specific MCC customer_id (when the account has many).")
     p.add_argument("--answer-changes", default="yes",
                    help="Reply to 'What changes have you made...?'")
     p.add_argument("--answer-details", default="yes",
@@ -378,7 +412,7 @@ def main() -> None:
     session = requests.Session()
 
     print("Step 1/3  Discovering session from cookies...")
-    cfg = discover_session(session, cookies, args.authuser)
+    cfg = discover_session(session, cookies, args.authuser, args.mcc)
     print(f"  MCC={cfg['manager_customer_id']}  __u={cfg['user_id']}  "
           f"__c={cfg['customer_id']}  f.sid={cfg['f_sid']}")
 

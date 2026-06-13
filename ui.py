@@ -35,16 +35,18 @@ class ScanWorker(QThread):
     done = pyqtSignal(object, object)   # (config_dict, accounts_list)
     failed = pyqtSignal(str)
 
-    def __init__(self, cookies: dict, authuser: str = "0"):
+    def __init__(self, cookies: dict, authuser: str = "0", forced_mcc: str = ""):
         super().__init__()
         self.cookies = cookies
         self.authuser = authuser
+        self.forced_mcc = forced_mcc
 
     def run(self):
         try:
             session = requests.Session()
             self.log.emit("Discovering session from cookies...")
-            cfg = auto.discover_session(session, self.cookies, self.authuser)
+            cfg = auto.discover_session(session, self.cookies, self.authuser,
+                                        self.forced_mcc)
             self.log.emit(
                 f"  MCC={cfg['manager_customer_id']}  __u={cfg['user_id']}  "
                 f"__c={cfg['customer_id']}  f.sid={cfg['f_sid']}"
@@ -227,6 +229,16 @@ class MainWindow(QMainWindow):
         self.authuser_edit = QLineEdit("0")
         self.authuser_edit.setFixedWidth(40)
         row1.addWidget(self.authuser_edit)
+
+        row1.addWidget(QLabel("force MCC (optional):"))
+        self.mcc_edit = QLineEdit()
+        self.mcc_edit.setPlaceholderText("e.g. 6793056170 — leave empty to auto-pick")
+        self.mcc_edit.setFixedWidth(220)
+        self.mcc_edit.setToolTip(
+            "If your Google account owns multiple MCCs, the discovery picks "
+            "the first one. Paste a specific MCC customer_id here to force it."
+        )
+        row1.addWidget(self.mcc_edit)
 
         row1.addStretch()
         v.addLayout(row1)
@@ -430,7 +442,11 @@ class MainWindow(QMainWindow):
             return
         self.btn_scan.setEnabled(False)
         self.append_log("--- Scanning ---")
-        self.scan_worker = ScanWorker(self.cookies, self.authuser_edit.text().strip() or "0")
+        self.scan_worker = ScanWorker(
+            self.cookies,
+            self.authuser_edit.text().strip() or "0",
+            self.mcc_edit.text().strip(),
+        )
         self.scan_worker.log.connect(self.append_log)
         self.scan_worker.done.connect(self.on_scan_done)
         self.scan_worker.failed.connect(self.on_scan_failed)
