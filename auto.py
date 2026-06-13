@@ -312,33 +312,19 @@ def list_accounts(session: requests.Session, cookies: dict, cfg: dict) -> list[d
             "ui_account_status":    info.get("32"),
         })
 
-    # Single-account fallback: the signed-in user isn't an MCC owner, so the
-    # manager-scoped list above returned nothing. Use cfg["customer_id"]
-    # (the __c value) because that's the real Google Ads customer behind the
-    # session. cfg["manager_customer_id"] (ocid) is often a navigation /
-    # workspace placeholder that the appeal endpoint rejects as ENTITY_DOES_NOT_EXIST.
+    # Single-account fallback: user isn't an MCC owner. Use ocid as the
+    # customer_id (it's the real Google Ads customer for this session). __c
+    # is a workspace/billing scope marker, not a customer the appeal endpoint
+    # can target — it rejects with AUTH_ERROR_CUSTOMER_NOT_FOUND.
     if not out:
-        cid = cfg["customer_id"] or cfg["manager_customer_id"]
         out.append({
-            "customer_id":          cid,
+            "customer_id":          cfg["manager_customer_id"],
             "descriptive_name":     "(your account)",
             "external_customer_id": "",
             "is_manager":           False,
             "is_hidden":            False,
             "ui_account_status":    None,
         })
-        # If ocid differs, expose it as a second candidate row so the user
-        # can try it manually if the first one doesn't work.
-        if (cfg["manager_customer_id"]
-                and cfg["manager_customer_id"] != cid):
-            out.append({
-                "customer_id":          cfg["manager_customer_id"],
-                "descriptive_name":     "(your account — alt ID)",
-                "external_customer_id": "",
-                "is_manager":           False,
-                "is_hidden":            False,
-                "ui_account_status":    None,
-            })
     return out
 
 
@@ -373,14 +359,16 @@ def appeal_headers(cfg: dict, customer_id: str) -> dict:
 
 def appeal_body(cfg: dict, customer_id: str,
                 answer_changes: str = "yes",
-                answer_details: str = "yes") -> str:
+                answer_details: str = "yes",
+                tag_primary: list = None,
+                tag_secondary: list = None) -> str:
     ar = {
         "1": {
             "1": str(customer_id),
             "2": "-1",
             "4": 2,
-            "9": APPEAL_ABUSE_TAG_IDS_PRIMARY,
-            "13": APPEAL_ABUSE_TAG_IDS_SECONDARY,
+            "9": tag_primary if tag_primary is not None else APPEAL_ABUSE_TAG_IDS_PRIMARY,
+            "13": tag_secondary if tag_secondary is not None else APPEAL_ABUSE_TAG_IDS_SECONDARY,
         },
         "2": [
             {
@@ -459,14 +447,16 @@ def classify(http_status: int, body: str) -> tuple[str, str]:
 
 
 def submit_one(session: requests.Session, cookies: dict, cfg: dict, customer_id: str,
-               answer_changes: str = "yes", answer_details: str = "yes"):
+               answer_changes: str = "yes", answer_details: str = "yes",
+               tag_primary: list = None, tag_secondary: list = None):
     url = APPEAL_URL_TMPL.format(authuser=cfg["authuser"], fsid=cfg["f_sid"])
     r = session.post(url, headers=appeal_headers(cfg, customer_id),
                      cookies=cookies,
-                     data=appeal_body(cfg, customer_id, answer_changes, answer_details),
+                     data=appeal_body(cfg, customer_id, answer_changes,
+                                      answer_details, tag_primary, tag_secondary),
                      timeout=30)
     tag, details = classify(r.status_code, r.text)
-    return r.status_code, tag, details, r.text[:280].replace("\n", " ")
+    return r.status_code, tag, details, r.text[:400].replace("\n", " ")
 
 
 # --- main -----------------------------------------------------------------

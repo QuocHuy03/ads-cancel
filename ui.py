@@ -76,7 +76,8 @@ class SubmitWorker(QThread):
 
     def __init__(self, cookies: dict, cfg: dict, targets: list, delay: float,
                  answer_changes: str = "yes", answer_details: str = "yes",
-                 threads: int = 1):
+                 threads: int = 1,
+                 tag_primary: list = None, tag_secondary: list = None):
         super().__init__()
         self.cookies = cookies
         self.cfg = cfg
@@ -85,6 +86,8 @@ class SubmitWorker(QThread):
         self.answer_changes = answer_changes
         self.answer_details = answer_details
         self.threads = max(1, int(threads))
+        self.tag_primary = tag_primary
+        self.tag_secondary = tag_secondary
         self._stop = False
 
     def stop(self):
@@ -114,7 +117,8 @@ class SubmitWorker(QThread):
                 try:
                     code, tag, details, snippet = auto.submit_one(
                         session, self.cookies, self.cfg, cid,
-                        self.answer_changes, self.answer_details)
+                        self.answer_changes, self.answer_details,
+                        self.tag_primary, self.tag_secondary)
                     label = f"{tag} ({details})" if details else tag
                     self.log.emit(
                         f"[{i}/{total}] {label:<32} {cid} ({name}) http={code}"
@@ -258,13 +262,34 @@ class MainWindow(QMainWindow):
         row_ans = QHBoxLayout()
         row_ans.addWidget(QLabel("Changes since last appeal:"))
         self.answer_changes_edit = QLineEdit("yes")
-        self.answer_changes_edit.setMinimumWidth(220)
+        self.answer_changes_edit.setMinimumWidth(180)
         row_ans.addWidget(self.answer_changes_edit, stretch=1)
         row_ans.addWidget(QLabel("Further details:"))
         self.answer_details_edit = QLineEdit("yes")
-        self.answer_details_edit.setMinimumWidth(220)
+        self.answer_details_edit.setMinimumWidth(180)
         row_ans.addWidget(self.answer_details_edit, stretch=1)
         v.addLayout(row_ans)
+
+        # Abuse-tag override row — different suspension reasons need different tag IDs.
+        row_tag = QHBoxLayout()
+        row_tag.addWidget(QLabel("abuse_tag_ids primary:"))
+        self.tag_primary_edit = QLineEdit("288")
+        self.tag_primary_edit.setFixedWidth(120)
+        self.tag_primary_edit.setToolTip(
+            "Comma-separated IDs sent as __ar.1.9 (abuse_tag_ids primary).\n"
+            "288 = Multi-account abuse. Other suspension reasons need different IDs."
+        )
+        row_tag.addWidget(self.tag_primary_edit)
+        row_tag.addWidget(QLabel("secondary:"))
+        self.tag_secondary_edit = QLineEdit("59")
+        self.tag_secondary_edit.setFixedWidth(120)
+        self.tag_secondary_edit.setToolTip(
+            "Comma-separated IDs sent as __ar.1.13 (abuse_tag_ids secondary).\n"
+            "59 goes with primary=288."
+        )
+        row_tag.addWidget(self.tag_secondary_edit)
+        row_tag.addStretch()
+        v.addLayout(row_tag)
 
         # Filter row
         row2 = QHBoxLayout()
@@ -640,10 +665,24 @@ class MainWindow(QMainWindow):
 
         ans_changes = self.answer_changes_edit.text().strip() or "yes"
         ans_details = self.answer_details_edit.text().strip() or "yes"
-        self.append_log(f"Answers — changes={ans_changes!r}  details={ans_details!r}")
+
+        def parse_int_csv(s: str, fallback: list) -> list:
+            try:
+                v = [int(x) for x in s.replace(" ", "").split(",") if x]
+                return v or fallback
+            except ValueError:
+                return fallback
+        tag_primary = parse_int_csv(self.tag_primary_edit.text(), [288])
+        tag_secondary = parse_int_csv(self.tag_secondary_edit.text(), [59])
+
+        self.append_log(
+            f"Answers — changes={ans_changes!r}  details={ans_details!r}  "
+            f"abuse_tag_ids primary={tag_primary} secondary={tag_secondary}"
+        )
         self.submit_worker = SubmitWorker(
             self.cookies, self.cfg, targets, delay,
             ans_changes, ans_details, threads,
+            tag_primary, tag_secondary,
         )
         self.submit_worker.log.connect(self.append_log)
         self.submit_worker.progress.connect(self.on_submit_progress)
@@ -663,6 +702,10 @@ class MainWindow(QMainWindow):
         tag_item = self.table.item(row, 6)
         tag_item.setText(cell_text)
         tag_item.setToolTip(body)
+        # For failures, also dump the body into the log so the user can read
+        # the specific error text without inspecting the JSON file.
+        if tag not in ("OK", "PENDING", "dry-run"):
+            self.append_log(f"  └─ {cid}: {body[:300]}")
         self.table.item(row, 7).setText(str(code) if code else "-")
         color = TAG_COLORS.get(tag)
         if color:
