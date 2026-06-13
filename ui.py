@@ -217,10 +217,12 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(root)
 
         # Cookie row
-        v.addWidget(QLabel("Cookie (paste from browser DevTools — Cookie header value):"))
+        v.addWidget(QLabel("Cookie (paste full cURL OR raw Cookie header value):"))
         self.cookie_edit = QPlainTextEdit()
         self.cookie_edit.setPlaceholderText(
-            "SID=...; HSID=...; SAPISID=...; __Secure-1PSID=...; __Secure-1PSIDCC=...; ..."
+            "Either:\n"
+            "  • Full cURL command from DevTools (right-click request → Copy as cURL)\n"
+            "  • Or raw cookie string: SID=...; HSID=...; SAPISID=...; __Secure-1PSID=...; ..."
         )
         self.cookie_edit.setMaximumHeight(80)
         self.cookie_edit.setFont(QFont("Consolas", 9))
@@ -400,6 +402,38 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(msg)
         self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
+    @staticmethod
+    def _extract_cookie_from_curl(text: str) -> str:
+        """If `text` looks like a cURL command, pull out the cookie value from
+        the -b / --cookie flag or a -H 'Cookie: …' header. Return None when
+        the input is plain key=value;... so the caller can pass it through."""
+        if "curl " not in text and " -b " not in text and "Cookie:" not in text:
+            return None
+
+        import re as _re
+        # Mac/Linux cURL: -b 'value' or -b $'value' or -b "value"
+        # Windows cmd cURL: -b ^"value^"
+        patterns = [
+            r"-b\s+\$?'([^']{20,})'",
+            r'-b\s+"([^"]{20,})"',
+            r'-b\s+\^"(.+?)\^"',
+            r"--cookie\s+\$?'([^']{20,})'",
+            r'--cookie\s+"([^"]{20,})"',
+            r"-H\s+\$?'[Cc]ookie:\s*([^']{20,})'",
+            r'-H\s+"[Cc]ookie:\s*([^"]{20,})"',
+            r'-H\s+\^"[Cc]ookie:\s*(.+?)\^"',
+        ]
+        for pat in patterns:
+            m = _re.search(pat, text, _re.DOTALL)
+            if m:
+                value = m.group(1)
+                # Strip Windows ^ escape characters that survived inside the match.
+                value = value.replace("^", "")
+                # Unescape ANSI-C backslash sequences cURL sometimes emits ($'...').
+                value = value.replace(r"\!", "!").replace(r"\\", "\\")
+                return value.strip()
+        return None
+
     def _load_existing_cookie(self):
         if COOKIE_FILE.exists():
             try:
@@ -428,11 +462,15 @@ class MainWindow(QMainWindow):
     def save_cookie(self):
         """Save the pasted cookies, merging with what's already on disk
         WHEN it's the same Google account (only rotating bits changed) and
-        REPLACING when the user has switched to a different account."""
+        REPLACING when the user has switched to a different account.
+        Also accepts a full cURL command: the cookie value is auto-extracted
+        from the -b / --cookie flag or from a -H 'Cookie: ...' header."""
         text = self.cookie_edit.toPlainText().strip()
         if not text:
             QMessageBox.warning(self, "Empty", "Cookie textarea is empty.")
             return
+
+        text = self._extract_cookie_from_curl(text) or text
 
         def parse(s: str) -> dict:
             out = {}
