@@ -47,6 +47,46 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 ACCOUNTS_URL_TMPL = "https://ads.google.com/aw/accounts?authuser={authuser}"
 
 
+class MultipleMCCsError(Exception):
+    """Raised by discover_session when the cookie owner has access to more
+    than one MCC and the caller didn't force one. The UI can catch this and
+    pop up a picker."""
+    def __init__(self, mccs: list):
+        super().__init__(f"Multiple MCCs available: {mccs}")
+        self.mccs = mccs   # list[(ocid, optional_name)]
+
+
+def list_available_mccs(session: requests.Session, cookies: dict,
+                        authuser: str) -> list[tuple[str, str]]:
+    """Hit /aw/accounts with a minimal UA and parse the resulting HTML for
+    every ocid the user can switch to. Returns [(ocid, label), ...]. The
+    label is best-effort — empty string when we couldn't find a name nearby."""
+    r = session.get(ACCOUNTS_URL_TMPL.format(authuser=authuser),
+                    headers={"user-agent": "Mozilla/5.0", "accept": "text/html"},
+                    cookies=cookies, allow_redirects=True, timeout=30)
+    if "accounts.google.com/" in r.url and "/signin/" in r.url:
+        raise RuntimeError("Cookie expired — refresh cookie.txt.")
+    text = r.text
+
+    ocids = sorted(set(re.findall(r"ocid[=:%][^0-9]?(\d{6,12})", text)))
+    pairs: list[tuple[str, str]] = []
+    for ocid in ocids:
+        # Best-effort name lookup — JSON blobs in the select-account page
+        # often embed account names alongside the ocid value.
+        name = ""
+        for pat in (
+            rf'"(?:name|descriptiveName|customerName)"\s*:\s*"([^"]{{1,80}})"[^{{}}]*"?ocid"?\s*:\s*"?{ocid}',
+            rf'"?ocid"?\s*:\s*"?{ocid}"?[^{{}}]*"(?:name|descriptiveName|customerName)"\s*:\s*"([^"]{{1,80}})"',
+            rf'aria-label="([^"]+?)"[^>]*ocid={ocid}',
+        ):
+            m = re.search(pat, text)
+            if m:
+                name = m.group(1)
+                break
+        pairs.append((ocid, name))
+    return pairs
+
+
 def data_dir() -> Path:
     """Where cookie.txt and appeal_results.json live.
 
@@ -113,11 +153,14 @@ def discover_session(session: requests.Session, cookies: dict, authuser: str,
 
     # Multi-account case: Google parks us at /nav/selectaccount until a pick.
     if "/nav/selectaccount" in r1.url or not ocid:
-        ocids = sorted(set(re.findall(r"ocid=(\d{6,12})", r1.text)))
+        ocids = sorted(set(re.findall(r"ocid[=:%][^0-9]?(\d{6,12})", r1.text)))
         if forced_ocid:
             pick = forced_ocid
-        elif ocids:
+        elif len(ocids) == 1:
             pick = ocids[0]
+        elif len(ocids) > 1:
+            # Hand control back to the caller so the UI can show a picker.
+            raise MultipleMCCsError([(o, "") for o in ocids])
         else:
             sys.exit(
                 f"Got {r1.url} but couldn't find any MCC IDs in the page. "

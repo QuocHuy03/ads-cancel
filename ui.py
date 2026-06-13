@@ -15,9 +15,9 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDoubleSpinBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QPushButton, QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QStatusBar, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 import auto   # reuse all the networking logic
@@ -34,6 +34,7 @@ class ScanWorker(QThread):
     log = pyqtSignal(str)
     done = pyqtSignal(object, object)   # (config_dict, accounts_list)
     failed = pyqtSignal(str)
+    mccs_needed = pyqtSignal(list)      # [(ocid, label), ...] — user must pick
 
     def __init__(self, cookies: dict, authuser: str = "0", forced_mcc: str = ""):
         super().__init__()
@@ -45,8 +46,13 @@ class ScanWorker(QThread):
         try:
             session = requests.Session()
             self.log.emit("Discovering session from cookies...")
-            cfg = auto.discover_session(session, self.cookies, self.authuser,
-                                        self.forced_mcc)
+            try:
+                cfg = auto.discover_session(session, self.cookies, self.authuser,
+                                            self.forced_mcc)
+            except auto.MultipleMCCsError as e:
+                self.log.emit(f"Found {len(e.mccs)} MCCs — waiting for picker...")
+                self.mccs_needed.emit(e.mccs)
+                return
             self.log.emit(
                 f"  MCC={cfg['manager_customer_id']}  __u={cfg['user_id']}  "
                 f"__c={cfg['customer_id']}  f.sid={cfg['f_sid']}"
@@ -450,7 +456,31 @@ class MainWindow(QMainWindow):
         self.scan_worker.log.connect(self.append_log)
         self.scan_worker.done.connect(self.on_scan_done)
         self.scan_worker.failed.connect(self.on_scan_failed)
+        self.scan_worker.mccs_needed.connect(self.on_mccs_needed)
         self.scan_worker.start()
+
+    def on_mccs_needed(self, mccs: list):
+        """Multiple MCCs available — let the user pick one, then re-scan."""
+        self.btn_scan.setEnabled(True)
+        items = [f"{ocid}  {label}".strip() for ocid, label in mccs]
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Pick an MCC",
+            f"Your Google account can access {len(mccs)} MCCs.\n"
+            "Choose which one to scan:",
+            items,
+            0,
+            False,  # not editable
+        )
+        if not ok:
+            self.append_log("Scan cancelled — no MCC picked.")
+            return
+        # The chosen item starts with the ocid; remember it in the field
+        # so subsequent scans skip the picker.
+        picked_ocid = choice.split()[0]
+        self.mcc_edit.setText(picked_ocid)
+        self.append_log(f"Picked MCC: {picked_ocid} — re-scanning...")
+        self.scan()
 
     def on_scan_failed(self, msg: str):
         self.btn_scan.setEnabled(True)
