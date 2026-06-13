@@ -162,9 +162,14 @@ def discover_session(session: requests.Session, cookies: dict, authuser: str,
             # Hand control back to the caller so the UI can show a picker.
             raise MultipleMCCsError([(o, "") for o in ocids])
         else:
+            # The account-chooser page is rendered by a Dart/JS bundle, so
+            # the list of available MCCs isn't in the initial HTML. Tell the
+            # user how to find their MCC id manually.
             sys.exit(
-                f"Got {r1.url} but couldn't find any MCC IDs in the page. "
-                "You may need to pick one manually."
+                "Your Google account has multiple MCCs and Google didn't "
+                "auto-pick one. Open https://ads.google.com in your browser, "
+                "click the MCC you want, then copy that page's URL (or just "
+                "the ocid=... number) into the 'MCC ID or URL' field and try again."
             )
         # Retry with an explicit ocid to skip the picker.
         r1 = session.get(

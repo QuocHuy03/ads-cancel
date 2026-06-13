@@ -236,15 +236,20 @@ class MainWindow(QMainWindow):
         self.authuser_edit.setFixedWidth(40)
         row1.addWidget(self.authuser_edit)
 
-        row1.addWidget(QLabel("force MCC (optional):"))
+        row1.addWidget(QLabel("MCC ID or URL:"))
         self.mcc_edit = QLineEdit()
-        self.mcc_edit.setPlaceholderText("e.g. 6793056170 — leave empty to auto-pick")
-        self.mcc_edit.setFixedWidth(220)
-        self.mcc_edit.setToolTip(
-            "If your Google account owns multiple MCCs, the discovery picks "
-            "the first one. Paste a specific MCC customer_id here to force it."
+        self.mcc_edit.setPlaceholderText(
+            "Paste full Ads URL (https://ads.google.com/aw/accounts?ocid=...) "
+            "or raw customer_id, or leave empty to auto-pick"
         )
-        row1.addWidget(self.mcc_edit)
+        self.mcc_edit.setMinimumWidth(360)
+        self.mcc_edit.setToolTip(
+            "If your Google account owns multiple MCCs, paste the URL of the\n"
+            "MCC's overview/accounts page from your browser address bar.\n"
+            "We'll extract the ocid (= manager customer_id) automatically.\n"
+            "You can also paste just the bare numeric ID."
+        )
+        row1.addWidget(self.mcc_edit, stretch=1)
 
         row1.addStretch()
         v.addLayout(row1)
@@ -448,10 +453,21 @@ class MainWindow(QMainWindow):
             return
         self.btn_scan.setEnabled(False)
         self.append_log("--- Scanning ---")
+
+        # Accept either a raw customer_id or a full Ads URL containing ocid=…
+        raw_mcc = self.mcc_edit.text().strip()
+        import re as _re
+        m = _re.search(r"ocid=(\d{6,12})", raw_mcc)
+        forced_mcc = m.group(1) if m else (raw_mcc if raw_mcc.isdigit() else "")
+        if raw_mcc and not forced_mcc:
+            self.append_log(f"WARN: couldn't parse MCC from {raw_mcc!r}; auto-picking.")
+        elif forced_mcc and forced_mcc != raw_mcc:
+            self.append_log(f"Extracted MCC {forced_mcc} from URL.")
+
         self.scan_worker = ScanWorker(
             self.cookies,
             self.authuser_edit.text().strip() or "0",
-            self.mcc_edit.text().strip(),
+            forced_mcc,
         )
         self.scan_worker.log.connect(self.append_log)
         self.scan_worker.done.connect(self.on_scan_done)
