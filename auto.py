@@ -287,13 +287,19 @@ def list_accounts(session: requests.Session, cookies: dict, cfg: dict) -> list[d
     }
     r = session.post(url, headers=headers, cookies=cookies,
                      data=urlencode(body), timeout=60)
+    # For non-MCC (single-account) users the manager-scoped List call can
+    # return a 4xx/5xx or an authorization error. In that case we fall through
+    # to the empty-list path and the single-account fallback below kicks in.
     if r.status_code != 200:
-        sys.exit(f"List HTTP {r.status_code}\n{r.text[:600]}")
-    data = json.loads(strip_xssi(r.text))
-    # Error responses surface inside data["5"]["2"] (a list of error objects).
-    errs = data.get("5", {}).get("2") if isinstance(data.get("5"), dict) else None
-    if errs and "1" not in data:
-        sys.exit(f"List API error:\n{json.dumps(errs, indent=2)[:800]}")
+        data = {}
+    else:
+        try:
+            data = json.loads(strip_xssi(r.text))
+        except json.JSONDecodeError:
+            data = {}
+        errs = data.get("5", {}).get("2") if isinstance(data.get("5"), dict) else None
+        if errs and "1" not in data:
+            data = {}   # treat as "no rows" — single-account fallback handles it
     out = []
     for raw in data.get("1", []):
         info = raw.get("3", {})
@@ -304,6 +310,20 @@ def list_accounts(session: requests.Session, cookies: dict, cfg: dict) -> list[d
             "is_manager":           info.get("7", False),
             "is_hidden":            info.get("8", False),
             "ui_account_status":    info.get("32"),
+        })
+
+    # Single-account fallback: the signed-in user isn't an MCC owner, so the
+    # manager-scoped list above returned nothing. Treat their own discovered
+    # customer (cfg.manager_customer_id) as the sole row in the table so the
+    # UI can still tick + submit it.
+    if not out:
+        out.append({
+            "customer_id":          cfg["manager_customer_id"],
+            "descriptive_name":     "(your account)",
+            "external_customer_id": "",
+            "is_manager":           False,
+            "is_hidden":            False,
+            "ui_account_status":    None,  # unknown — we didn't get status info
         })
     return out
 

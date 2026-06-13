@@ -508,10 +508,24 @@ class MainWindow(QMainWindow):
         self.cfg = cfg
         self.accounts = accounts
         self._populate_table(accounts)
-        self.apply_filter()
-        self.statusBar().showMessage(
-            f"Scanned: {len(accounts)} accounts. Apply filter and click Submit."
-        )
+
+        # Single-account fallback: only one row and it's the synthetic
+        # "(your account)" entry. Skip the MCC_Child prefix filter — there's
+        # no cohort to filter, just tick the single row.
+        if len(accounts) == 1 and accounts[0].get("descriptive_name") == "(your account)":
+            self.table.cellWidget(0, 0).setChecked(True)
+            self.append_log(
+                "Single-account mode: no MCC sub-accounts found. "
+                "The discovered customer was added as the sole target."
+            )
+            self.statusBar().showMessage(
+                "Single account ready. Click Submit to re-appeal it."
+            )
+        else:
+            self.apply_filter()
+            self.statusBar().showMessage(
+                f"Scanned: {len(accounts)} accounts. Apply filter and click Submit."
+            )
 
     def _populate_table(self, accounts: list):
         self.table.setRowCount(0)
