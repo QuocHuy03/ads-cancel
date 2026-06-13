@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-13      # Intel x86_64 (runs on Apple Silicon via Rosetta 2)
+    runs-on: macos-latest  # Apple Silicon arm64 — faster queue, native on M-series
     steps:
       - uses: actions/checkout@v4
 
@@ -30,17 +30,17 @@ jobs:
 
       - name: Zip the .app
         working-directory: dist
-        run: zip -r AdsCancel-macos-x86_64.zip AdsCancel.app
+        run: zip -r AdsCancel-macos.zip AdsCancel.app
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AdsCancel-macos-x86_64
-          path: dist/AdsCancel-macos-x86_64.zip
+          name: AdsCancel-macos
+          path: dist/AdsCancel-macos.zip
 
       - name: Attach to release on tag push
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           fail_on_unmatched_files: false
-          files: dist/AdsCancel-macos-x86_64.zip
+          files: dist/AdsCancel-macos.zip
