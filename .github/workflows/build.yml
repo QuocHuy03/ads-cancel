@@ -8,18 +8,7 @@ on:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: windows-latest
-            label: windows-x64
-          - runner: macos-13         # Intel x86_64
-            label: macos-x86_64
-          - runner: macos-latest     # Apple Silicon arm64
-            label: macos-arm64
-    runs-on: ${{ matrix.runner }}
-
+    runs-on: macos-13      # Intel x86_64 (runs on Apple Silicon via Rosetta 2)
     steps:
       - uses: actions/checkout@v4
 
@@ -28,49 +17,30 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install build deps
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller PyQt5 requests
 
-      # ---- Windows: single .exe ----
-      - name: Build .exe (Windows)
-        if: runner.os == 'Windows'
-        run: pyinstaller --noconfirm --windowed --onefile --name AdsCancel ui.py
-
-      - name: Upload Windows artifact
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: AdsCancel-${{ matrix.label }}
-          path: dist/AdsCancel.exe
-
-      # ---- macOS: .app bundle ----
-      - name: Build .app (macOS)
-        if: runner.os == 'macOS'
+      - name: Build .app bundle
         run: |
           pyinstaller --noconfirm --windowed --name AdsCancel \
               --osx-bundle-identifier com.adscancel.app \
               ui.py
 
-      - name: Zip .app (macOS)
-        if: runner.os == 'macOS'
+      - name: Zip the .app
         working-directory: dist
-        run: zip -r AdsCancel-${{ matrix.label }}.zip AdsCancel.app
+        run: zip -r AdsCancel-macos-x86_64.zip AdsCancel.app
 
-      - name: Upload macOS artifact
-        if: runner.os == 'macOS'
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AdsCancel-${{ matrix.label }}
-          path: dist/AdsCancel-${{ matrix.label }}.zip
+          name: AdsCancel-macos-x86_64
+          path: dist/AdsCancel-macos-x86_64.zip
 
-      # ---- Release on tag push ----
-      - name: Attach to release
+      - name: Attach to release on tag push
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           fail_on_unmatched_files: false
-          files: |
-            dist/AdsCancel.exe
-            dist/AdsCancel-${{ matrix.label }}.zip
+          files: dist/AdsCancel-macos-x86_64.zip
