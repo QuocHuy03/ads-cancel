@@ -1,4 +1,10 @@
 {
-  "drapt": "AEjHL4OnGVnvMPTZ9TipS3wCty2mbNg8o0FWkU0ecapoTyOLBoHVjk8WNRLDRj3a8WW40UHK9uC4A8WTxwgzJMfYN73Q81oQjvY2lrc_K9RNt14OTIrb5hQ",
-  "user_context": ""
+  "drapt": "AEjHL4PwHAFZ4cBkIVYZAbAPvCLr32-a_Cc0fKDnZEyVDzndAyTacHsuWoZgC9XZ0IyS_SKd-176KAL_NlFCeyD2qufEX0FsN2uCRGhsu0d41yidSk6Hgds",
+  "headers": {
+    "user-context": "AaIkTFp1Jtjgd6FACkH68MUhvRAXs+CNiwgJKwsH+9rOmuEa8BKBa3mw66eVNj41t1yu66b0jDnpStlSdeY3NAAekic=",
+    "x-browser-validation": "G8KrLXnGgujqecAMCOK3QJI9cOw=",
+    "x-browser-channel": "stable",
+    "x-browser-copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
+    "x-browser-year": "2026"
+  }
 }
