@@ -371,7 +371,22 @@ APPEAL_URL_TMPL = (
 )
 
 
-def appeal_headers(cfg: dict, customer_id: str, extras: dict = None) -> dict:
+def _appeal_referer(cfg: dict, customer_id: str, place: str) -> str:
+    """The page Chrome was on when it fired the appeal. The 'Suspicious
+    Payment' questionnaire is reached from /aw/overview; the simple yes/yes
+    re-appeal is reached from /aw/preferences. Google checks this matches."""
+    if place == "/aw/preferences":
+        return (f"https://ads.google.com/aw/preferences?ocid={customer_id}"
+                f"&ascid={customer_id}&authuser={cfg['authuser']}"
+                f"&__u={cfg['user_id']}&__c={cfg['customer_id']}")
+    return (f"https://ads.google.com/aw/overview?ocid={customer_id}"
+            f"&euid={cfg['login_user_id']}&__u={cfg['user_id']}"
+            f"&uscid={cfg['manager_customer_id']}&__c={cfg['customer_id']}"
+            f"&authuser={cfg['authuser']}")
+
+
+def appeal_headers(cfg: dict, customer_id: str, extras: dict = None,
+                   place: str = "/aw/overview") -> dict:
     """Mirror what Chrome sends to the appeal endpoint. `extras` carries the
     session-bound headers Google now checks on authenticated mutations:
     user-context, request-context, x-client-data, x-browser-validation,
@@ -385,12 +400,7 @@ def appeal_headers(cfg: dict, customer_id: str, extras: dict = None) -> dict:
         "pragma": "no-cache",
         "content-type": "application/x-www-form-urlencoded",
         "origin": "https://ads.google.com",
-        "referer": (
-            f"https://ads.google.com/aw/overview?ocid={customer_id}"
-            f"&euid={cfg['login_user_id']}&__u={cfg['user_id']}"
-            f"&uscid={cfg['manager_customer_id']}&__c={cfg['customer_id']}"
-            f"&authuser={cfg['authuser']}"
-        ),
+        "referer": _appeal_referer(cfg, customer_id, place),
         "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
@@ -410,12 +420,13 @@ def appeal_headers(cfg: dict, customer_id: str, extras: dict = None) -> dict:
 
 def _appeal_body(cfg: dict, customer_id: str, questions: list,
                  tag_primary: list, tag_secondary: list,
-                 drapt: str = "") -> str:
+                 drapt: str = "", place: str = "/aw/overview") -> str:
     """Build the urlencoded Submit body for any appeal form.
 
     `questions` is a list of {"1": field_id, "2": question_text, "3": answer}.
     `tag_primary`/`tag_secondary` are the __ar.1.9 / __ar.1.13 tag-id lists that
-    tell Google which suspension reason this appeal is for."""
+    tell Google which suspension reason this appeal is for.
+    `place` is the originating page (/aw/overview or /aw/preferences)."""
     ar = {
         "1": {
             "1": str(customer_id),
@@ -439,15 +450,42 @@ def _appeal_body(cfg: dict, customer_id: str, questions: list,
         "activityType":     "INTERACTIVE",
         "activityId":       "475126922029082",
         "uniqueFingerprint": f"{cfg['f_sid']}_475126922029082_1",
-        "previousPlace":    "/aw/overview",
+        "previousPlace":    place,
         "activityName":     "AccountAppealFormSlidealog.AccountAppealFormStepper.Submit",
-        "destinationPlace": "/aw/overview",
+        "destinationPlace": place,
     }
     # DRAPT is the 2FA proof token Google now requires for authenticated
     # mutations — sent as a body field, not a cookie.
     if drapt:
         body["drapt"] = drapt
     return urlencode(body)
+
+
+# Simple "yes/yes" re-appeal (2 questions) — reached from /aw/preferences.
+# Captured success used these tag ids.
+APPEAL_SIMPLE_TAG_IDS_PRIMARY   = [14]   # __ar.1.9
+APPEAL_SIMPLE_TAG_IDS_SECONDARY = [3]    # __ar.1.13
+
+
+def appeal_body_simple(cfg: dict, customer_id: str,
+                       answer_changes: str = "yes", answer_details: str = "yes",
+                       tag_primary: list = None, tag_secondary: list = None,
+                       drapt: str = "") -> str:
+    """Short 2-question re-appeal submitted from the Account Preferences page."""
+    questions = [
+        {"1": "inputChangesFromLastAppeal",
+         "2": "What changes have you made to your account or payments since the last appeal?",
+         "3": answer_changes},
+        {"1": "inputFurtherDetailsSinceLastAppeal",
+         "2": "Is there any other info that wasn't included in the last appeal?",
+         "3": answer_details},
+    ]
+    return _appeal_body(
+        cfg, customer_id, questions,
+        tag_primary if tag_primary is not None else APPEAL_SIMPLE_TAG_IDS_PRIMARY,
+        tag_secondary if tag_secondary is not None else APPEAL_SIMPLE_TAG_IDS_SECONDARY,
+        drapt=drapt, place="/aw/preferences",
+    )
 
 
 def appeal_body_payment(cfg: dict, customer_id: str, answers: dict = None,
@@ -515,14 +553,24 @@ def classify(http_status: int, body: str) -> tuple[str, str]:
 
 
 def submit_one(session: requests.Session, cookies: dict, cfg: dict, customer_id: str,
-               payment_answers: dict = None,
+               payment_answers: dict = None, simple_answers: dict = None,
                tag_primary: list = None, tag_secondary: list = None,
                drapt: str = "", extras: dict = None):
-    """Submit the 'Suspicious Payment Activity' questionnaire appeal."""
+    """Submit an appeal. With `simple_answers` -> short yes/yes form from the
+    Preferences page; otherwise the 'Suspicious Payment Activity' questionnaire."""
     url = APPEAL_URL_TMPL.format(authuser=cfg["authuser"], fsid=cfg["f_sid"])
-    data = appeal_body_payment(cfg, customer_id, payment_answers or {},
-                               tag_primary, tag_secondary, drapt=drapt)
-    r = session.post(url, headers=appeal_headers(cfg, customer_id, extras),
+    if simple_answers is not None:
+        data = appeal_body_simple(
+            cfg, customer_id,
+            simple_answers.get("changes", "yes"),
+            simple_answers.get("details", "yes"),
+            tag_primary, tag_secondary, drapt=drapt)
+        place = "/aw/preferences"
+    else:
+        data = appeal_body_payment(cfg, customer_id, payment_answers or {},
+                                   tag_primary, tag_secondary, drapt=drapt)
+        place = "/aw/overview"
+    r = session.post(url, headers=appeal_headers(cfg, customer_id, extras, place),
                      cookies=cookies, data=data, timeout=30)
     tag, details = classify(r.status_code, r.text)
     return r.status_code, tag, details, r.text[:400].replace("\n", " ")

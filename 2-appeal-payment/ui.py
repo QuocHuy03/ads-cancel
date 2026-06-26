@@ -76,23 +76,21 @@ class SubmitWorker(QThread):
     done = pyqtSignal()
 
     def __init__(self, cookies: dict, cfg: dict, targets: list, delay: float,
-                 answer_changes: str = "yes", answer_details: str = "yes",
                  threads: int = 1,
                  tag_primary: list = None, tag_secondary: list = None,
-                 payment_answers: dict = None):
+                 payment_answers: dict = None, simple_answers: dict = None):
         super().__init__()
         self.cookies = cookies
         self.cfg = cfg
         self.targets = targets   # list of (row, customer_id, name)
         self.delay = delay
-        self.answer_changes = answer_changes
-        self.answer_details = answer_details
         self.threads = max(1, int(threads))
         self.tag_primary = tag_primary
         self.tag_secondary = tag_secondary
-        # When set, submit the "Suspicious Payment Activity" questionnaire
-        # instead of the abuse re-appeal form.
+        # Exactly one of these is set: payment_answers -> 11-question form;
+        # simple_answers -> short yes/yes re-appeal from the Preferences page.
         self.payment_answers = payment_answers
+        self.simple_answers = simple_answers
         self._stop = False
 
     def stop(self):
@@ -127,6 +125,7 @@ class SubmitWorker(QThread):
                     code, tag, details, snippet = auto.submit_one(
                         session, self.cookies, self.cfg, cid,
                         payment_answers=self.payment_answers,
+                        simple_answers=self.simple_answers,
                         tag_primary=self.tag_primary,
                         tag_secondary=self.tag_secondary,
                         drapt=_drapt, extras=_extras)
@@ -281,6 +280,18 @@ class MainWindow(QMainWindow):
         row1.addStretch()
         v.addLayout(row1)
 
+        # Short yes/yes re-appeal answers (the 2-question Preferences form).
+        row_simple = QHBoxLayout()
+        row_simple.addWidget(QLabel("Changes since last appeal:"))
+        self.simple_changes_edit = QLineEdit("yes")
+        self.simple_changes_edit.setMinimumWidth(160)
+        row_simple.addWidget(self.simple_changes_edit, stretch=1)
+        row_simple.addWidget(QLabel("Further details:"))
+        self.simple_details_edit = QLineEdit("yes")
+        self.simple_details_edit.setMinimumWidth(160)
+        row_simple.addWidget(self.simple_details_edit, stretch=1)
+        v.addLayout(row_simple)
+
         # Suspicious-Payment questionnaire — inline, collapsible. One shared set
         # of answers is submitted for every checked account.
         self._build_payment_inputs(v)
@@ -384,7 +395,16 @@ class MainWindow(QMainWindow):
         self.summary_lbl = QLabel("0 / 0 selected")
         row3.addWidget(self.summary_lbl)
 
-        self.btn_submit_payment = QPushButton("Submit appeal for checked")
+        self.btn_submit_simple = QPushButton("Submit yes/yes appeal")
+        self.btn_submit_simple.setStyleSheet("background-color:#188038; color:white; padding:8px 16px;")
+        self.btn_submit_simple.setToolTip(
+            "Short 2-question re-appeal (Changes / Further details) submitted\n"
+            "from the Account Preferences page (tag 14/3)."
+        )
+        self.btn_submit_simple.clicked.connect(self.submit_checked_simple)
+        row3.addWidget(self.btn_submit_simple)
+
+        self.btn_submit_payment = QPushButton("Submit payment appeal")
         self.btn_submit_payment.setStyleSheet("background-color:#1a73e8; color:white; padding:8px 16px;")
         self.btn_submit_payment.setToolTip(
             "Suspicious Payment Activity questionnaire (11 questions, one\n"
@@ -801,12 +821,8 @@ class MainWindow(QMainWindow):
         n = sum(1 for r in range(total) if self._is_row_checked(r))
         self.summary_lbl.setText(f"{n} / {total} selected")
 
-    def submit_checked_payment(self):
-        """Submit the 'Suspicious Payment Activity' questionnaire for every
-        checked row, using one shared set of answers."""
-        if not self.cfg:
-            QMessageBox.warning(self, "Not scanned", "Scan first.")
-            return
+    def _collect_targets(self):
+        """Rows ticked -> [(row, cid, name)], clearing their result columns."""
         targets = []
         for r in range(self.table.rowCount()):
             if self._is_row_checked(r):
@@ -815,6 +831,55 @@ class MainWindow(QMainWindow):
                 self.table.item(r, 6).setText("")
                 self.table.item(r, 7).setText("")
                 targets.append((r, cid, name))
+        return targets
+
+    def submit_checked_simple(self):
+        """Submit the short yes/yes re-appeal (2 questions) for every checked row."""
+        if not self.cfg:
+            QMessageBox.warning(self, "Not scanned", "Scan first.")
+            return
+        targets = self._collect_targets()
+        if not targets:
+            QMessageBox.information(self, "Empty", "No rows checked.")
+            return
+
+        simple = {
+            "changes": self.simple_changes_edit.text().strip() or "yes",
+            "details": self.simple_details_edit.text().strip() or "yes",
+        }
+        delay = self.delay_spin.value()
+        threads = self.threads_spin.value()
+        eta = len(targets) * delay / 60 / max(1, threads)
+        ans = QMessageBox.question(
+            self, "Confirm yes/yes appeal",
+            f"Submit the short 2-question re-appeal for {len(targets)} accounts "
+            f"with {threads} thread(s)?  (~{eta:.1f} min)\n\n"
+            f"changes={simple['changes']!r}  details={simple['details']!r}",
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        self.append_log(
+            f"--- Submitting {len(targets)} YES/YES appeals ({threads} threads) ---"
+        )
+        self._begin_submit()
+        self.submit_worker = SubmitWorker(
+            self.cookies, self.cfg, targets, delay,
+            threads=threads, simple_answers=simple,
+        )
+        self.submit_worker.log.connect(self.append_log)
+        self.submit_worker.progress.connect(self.on_submit_progress)
+        self.submit_worker.done.connect(self.on_submit_done)
+        self.submit_worker.start()
+        self._results = []
+
+    def submit_checked_payment(self):
+        """Submit the 'Suspicious Payment Activity' questionnaire for every
+        checked row, using one shared set of answers."""
+        if not self.cfg:
+            QMessageBox.warning(self, "Not scanned", "Scan first.")
+            return
+        targets = self._collect_targets()
         if not targets:
             QMessageBox.information(self, "Empty", "No rows checked.")
             return
@@ -839,10 +904,7 @@ class MainWindow(QMainWindow):
             f"({threads} threads) ---"
         )
         self.append_log(f"Answers: {answers}")
-        self.btn_submit_payment.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.btn_scan.setEnabled(False)
-
+        self._begin_submit()
         self.submit_worker = SubmitWorker(
             self.cookies, self.cfg, targets, delay,
             threads=threads, payment_answers=answers,
@@ -852,6 +914,12 @@ class MainWindow(QMainWindow):
         self.submit_worker.done.connect(self.on_submit_done)
         self.submit_worker.start()
         self._results = []
+
+    def _begin_submit(self):
+        self.btn_submit_simple.setEnabled(False)
+        self.btn_submit_payment.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.btn_scan.setEnabled(False)
 
     def stop_submit(self):
         if self.submit_worker:
@@ -883,6 +951,7 @@ class MainWindow(QMainWindow):
                               "details": details, "body": body[:200]})
 
     def on_submit_done(self):
+        self.btn_submit_simple.setEnabled(True)
         self.btn_submit_payment.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_scan.setEnabled(True)
