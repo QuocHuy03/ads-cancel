@@ -126,10 +126,10 @@ class SubmitWorker(QThread):
                     _drapt, _extras = auto.load_session_extras()
                     code, tag, details, snippet = auto.submit_one(
                         session, self.cookies, self.cfg, cid,
-                        self.answer_changes, self.answer_details,
-                        self.tag_primary, self.tag_secondary,
-                        drapt=_drapt, extras=_extras,
-                        payment_answers=self.payment_answers)
+                        payment_answers=self.payment_answers,
+                        tag_primary=self.tag_primary,
+                        tag_secondary=self.tag_secondary,
+                        drapt=_drapt, extras=_extras)
                     label = f"{tag} ({details})" if details else tag
                     self.log.emit(
                         f"[{i}/{total}] {label:<32} {cid} ({name}) http={code}"

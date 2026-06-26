@@ -38,10 +38,7 @@ import requests
 NAME_PREFIX = ""             # empty = no name filter (default tick everything)
 STATUS_TARGET = 2            # ui_account_status: 2 = policy/abuse-suspended
 
-APPEAL_ABUSE_TAG_IDS_PRIMARY   = [288]   # __ar.1.9
-APPEAL_ABUSE_TAG_IDS_SECONDARY = [59]    # __ar.1.13
-
-# "Suspicious Payment Activity" suspensions use a different tag set + a longer
+# "Suspicious Payment Activity" suspensions use this tag set + the longer
 # questionnaire (see appeal_body_payment / PAYMENT_QUESTIONS below).
 APPEAL_PAYMENT_TAG_IDS_PRIMARY   = [193]  # __ar.1.9
 APPEAL_PAYMENT_TAG_IDS_SECONDARY = [3]    # __ar.1.13
@@ -453,33 +450,6 @@ def _appeal_body(cfg: dict, customer_id: str, questions: list,
     return urlencode(body)
 
 
-def appeal_body(cfg: dict, customer_id: str,
-                answer_changes: str = "yes",
-                answer_details: str = "yes",
-                tag_primary: list = None,
-                tag_secondary: list = None,
-                drapt: str = "") -> str:
-    """"Multiple account abuse" re-appeal form (2 yes/no questions)."""
-    questions = [
-        {
-            "1": "inputChangesFromLastAppeal",
-            "2": "What changes have you made to your account or payments since the last appeal?",
-            "3": answer_changes,
-        },
-        {
-            "1": "inputFurtherDetailsSinceLastAppeal",
-            "2": "Is there any other info that wasn't included in the last appeal?",
-            "3": answer_details,
-        },
-    ]
-    return _appeal_body(
-        cfg, customer_id, questions,
-        tag_primary if tag_primary is not None else APPEAL_ABUSE_TAG_IDS_PRIMARY,
-        tag_secondary if tag_secondary is not None else APPEAL_ABUSE_TAG_IDS_SECONDARY,
-        drapt=drapt,
-    )
-
-
 def appeal_body_payment(cfg: dict, customer_id: str, answers: dict = None,
                         tag_primary: list = None, tag_secondary: list = None,
                         drapt: str = "") -> str:
@@ -545,18 +515,13 @@ def classify(http_status: int, body: str) -> tuple[str, str]:
 
 
 def submit_one(session: requests.Session, cookies: dict, cfg: dict, customer_id: str,
-               answer_changes: str = "yes", answer_details: str = "yes",
+               payment_answers: dict = None,
                tag_primary: list = None, tag_secondary: list = None,
-               drapt: str = "", extras: dict = None,
-               payment_answers: dict = None):
+               drapt: str = "", extras: dict = None):
+    """Submit the 'Suspicious Payment Activity' questionnaire appeal."""
     url = APPEAL_URL_TMPL.format(authuser=cfg["authuser"], fsid=cfg["f_sid"])
-    if payment_answers is not None:
-        # "Suspicious Payment Activity" questionnaire form.
-        data = appeal_body_payment(cfg, customer_id, payment_answers,
-                                   tag_primary, tag_secondary, drapt=drapt)
-    else:
-        data = appeal_body(cfg, customer_id, answer_changes, answer_details,
-                           tag_primary, tag_secondary, drapt=drapt)
+    data = appeal_body_payment(cfg, customer_id, payment_answers or {},
+                               tag_primary, tag_secondary, drapt=drapt)
     r = session.post(url, headers=appeal_headers(cfg, customer_id, extras),
                      cookies=cookies, data=data, timeout=30)
     tag, details = classify(r.status_code, r.text)
