@@ -9,6 +9,19 @@ on:
 jobs:
   build:
     runs-on: macos-latest  # Apple Silicon arm64 — faster queue, native on M-series
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: AdsCancel-Appeal-Abuse
+            dir: 1-appeal-abuse
+            entry: ui.py
+          - name: AdsCancel-Appeal-Payment
+            dir: 2-appeal-payment
+            entry: ui.py
+          - name: AdsCancel-Create-MCC
+            dir: 3-create-mcc
+            entry: create_mcc_ui.py
     steps:
       - uses: actions/checkout@v4
 
@@ -23,24 +36,25 @@ jobs:
           pip install pyinstaller PyQt5 requests
 
       - name: Build .app bundle
+        working-directory: ${{ matrix.dir }}
         run: |
-          pyinstaller --noconfirm --windowed --name AdsCancel \
-              --osx-bundle-identifier com.adscancel.app \
-              ui.py
+          pyinstaller --noconfirm --windowed --name "${{ matrix.name }}" \
+              --osx-bundle-identifier "com.adscancel.${{ matrix.name }}" \
+              "${{ matrix.entry }}"
 
       - name: Zip the .app
-        working-directory: dist
-        run: zip -r AdsCancel-macos.zip AdsCancel.app
+        working-directory: ${{ matrix.dir }}/dist
+        run: zip -r "${{ matrix.name }}-macos.zip" "${{ matrix.name }}.app"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AdsCancel-macos
-          path: dist/AdsCancel-macos.zip
+          name: ${{ matrix.name }}-macos
+          path: ${{ matrix.dir }}/dist/${{ matrix.name }}-macos.zip
 
       - name: Attach to release on tag push
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           fail_on_unmatched_files: false
-          files: dist/AdsCancel-macos.zip
+          files: ${{ matrix.dir }}/dist/${{ matrix.name }}-macos.zip

@@ -41,6 +41,27 @@ STATUS_TARGET = 2            # ui_account_status: 2 = policy/abuse-suspended
 APPEAL_ABUSE_TAG_IDS_PRIMARY   = [288]   # __ar.1.9
 APPEAL_ABUSE_TAG_IDS_SECONDARY = [59]    # __ar.1.13
 
+# "Suspicious Payment Activity" suspensions use a different tag set + a longer
+# questionnaire (see appeal_body_payment / PAYMENT_QUESTIONS below).
+APPEAL_PAYMENT_TAG_IDS_PRIMARY   = [193]  # __ar.1.9
+APPEAL_PAYMENT_TAG_IDS_SECONDARY = [3]    # __ar.1.13
+
+# (field_id, question_text, default_answer) captured from a real browser submit.
+# question_text must match exactly what the Ads UI sends in __ar.2[*].2.
+PAYMENT_QUESTIONS = [
+    ("inputCountries",                 "Which country will the business run ads in?",                  "United States"),
+    ("inputBusinessModel",             "What does your organization do?",                              ""),
+    ("isAdvertisingOwnBusiness",       "Are you the owner or a direct employee of your organization?", "true"),
+    ("inputDomain",                    "What's your organization's website?",                          ""),
+    ("isBusinessModelChanged",         "Has your organization changed in the last 3 days?",            "false"),
+    ("isUsingAffiliatedMarketing",     "Is your organization part of an affiliate program?",           "false"),
+    ("isHavingMultipleGoogleAccounts", "Do you have multiple google accounts?",                        "false"),
+    ("isManagedByDifferentOrganization","Is the business managed by a different organization?",         "false"),
+    ("inputWhoOwnsPaymentInstrument",  "Who pays for this account?",                                   "me"),
+    ("inputPaymentOption",             "How do you pay for Google Ads?",                               "card"),
+    ("lastPaymentDate",                "When was your last payment?",                                  ""),
+]
+
 DEFAULT_DELAY = 1.5
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -54,6 +75,20 @@ class MultipleMCCsError(Exception):
     def __init__(self, mccs: list):
         super().__init__(f"Multiple MCCs available: {mccs}")
         self.mccs = mccs   # list[(ocid, optional_name)]
+
+
+def load_session_extras() -> tuple[str, dict]:
+    """Read the DRAPT token + extra Chrome headers from session_extras.json
+    next to cookie.txt. Returns (drapt, headers_dict). Empty defaults if the
+    file doesn't exist yet — the appeal/create code degrades gracefully."""
+    path = data_dir() / "session_extras.json"
+    if not path.exists():
+        return "", {}
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return "", {}
+    return d.get("drapt", "") or "", d.get("headers", {}) or {}
 
 
 def list_available_mccs(session: requests.Session, cookies: dict,
@@ -339,10 +374,18 @@ APPEAL_URL_TMPL = (
 )
 
 
-def appeal_headers(cfg: dict, customer_id: str) -> dict:
-    return {
+def appeal_headers(cfg: dict, customer_id: str, extras: dict = None) -> dict:
+    """Mirror what Chrome sends to the appeal endpoint. `extras` carries the
+    session-bound headers Google now checks on authenticated mutations:
+    user-context, request-context, x-client-data, x-browser-validation,
+    x-browser-channel/copyright/year. Capture them from a real cURL once and
+    persist via the UI's session_extras.json — every appeal then mirrors a
+    valid browser request."""
+    h = {
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
         "content-type": "application/x-www-form-urlencoded",
         "origin": "https://ads.google.com",
         "referer": (
@@ -351,39 +394,42 @@ def appeal_headers(cfg: dict, customer_id: str) -> dict:
             f"&uscid={cfg['manager_customer_id']}&__c={cfg['customer_id']}"
             f"&authuser={cfg['authuser']}"
         ),
+        "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
         "user-agent": UA,
         "x-framework-xsrf-token": cfg["xsrf_token"],
         "x-same-domain": "1",
     }
+    if extras:
+        for k, v in extras.items():
+            if v:
+                h[k] = v
+    return h
 
 
-def appeal_body(cfg: dict, customer_id: str,
-                answer_changes: str = "yes",
-                answer_details: str = "yes",
-                tag_primary: list = None,
-                tag_secondary: list = None) -> str:
+def _appeal_body(cfg: dict, customer_id: str, questions: list,
+                 tag_primary: list, tag_secondary: list,
+                 drapt: str = "") -> str:
+    """Build the urlencoded Submit body for any appeal form.
+
+    `questions` is a list of {"1": field_id, "2": question_text, "3": answer}.
+    `tag_primary`/`tag_secondary` are the __ar.1.9 / __ar.1.13 tag-id lists that
+    tell Google which suspension reason this appeal is for."""
     ar = {
         "1": {
             "1": str(customer_id),
             "2": "-1",
             "4": 2,
-            "9": tag_primary if tag_primary is not None else APPEAL_ABUSE_TAG_IDS_PRIMARY,
-            "13": tag_secondary if tag_secondary is not None else APPEAL_ABUSE_TAG_IDS_SECONDARY,
+            "9": tag_primary,
+            "13": tag_secondary,
         },
-        "2": [
-            {
-                "1": "inputChangesFromLastAppeal",
-                "2": "What changes have you made to your account or payments since the last appeal?",
-                "3": answer_changes,
-            },
-            {
-                "1": "inputFurtherDetailsSinceLastAppeal",
-                "2": "Is there any other info that wasn't included in the last appeal?",
-                "3": answer_details,
-            },
-        ],
+        "2": questions,
     }
-    return urlencode({
+    body = {
         "hl": "en_US",
         "__lu": cfg["login_user_id"],
         "__u":  cfg["user_id"],
@@ -399,7 +445,59 @@ def appeal_body(cfg: dict, customer_id: str,
         "previousPlace":    "/aw/overview",
         "activityName":     "AccountAppealFormSlidealog.AccountAppealFormStepper.Submit",
         "destinationPlace": "/aw/overview",
-    })
+    }
+    # DRAPT is the 2FA proof token Google now requires for authenticated
+    # mutations — sent as a body field, not a cookie.
+    if drapt:
+        body["drapt"] = drapt
+    return urlencode(body)
+
+
+def appeal_body(cfg: dict, customer_id: str,
+                answer_changes: str = "yes",
+                answer_details: str = "yes",
+                tag_primary: list = None,
+                tag_secondary: list = None,
+                drapt: str = "") -> str:
+    """"Multiple account abuse" re-appeal form (2 yes/no questions)."""
+    questions = [
+        {
+            "1": "inputChangesFromLastAppeal",
+            "2": "What changes have you made to your account or payments since the last appeal?",
+            "3": answer_changes,
+        },
+        {
+            "1": "inputFurtherDetailsSinceLastAppeal",
+            "2": "Is there any other info that wasn't included in the last appeal?",
+            "3": answer_details,
+        },
+    ]
+    return _appeal_body(
+        cfg, customer_id, questions,
+        tag_primary if tag_primary is not None else APPEAL_ABUSE_TAG_IDS_PRIMARY,
+        tag_secondary if tag_secondary is not None else APPEAL_ABUSE_TAG_IDS_SECONDARY,
+        drapt=drapt,
+    )
+
+
+def appeal_body_payment(cfg: dict, customer_id: str, answers: dict = None,
+                        tag_primary: list = None, tag_secondary: list = None,
+                        drapt: str = "") -> str:
+    """"Suspicious Payment Activity" appeal form (the longer questionnaire).
+
+    `answers` maps field_id -> answer; any field omitted falls back to the
+    default captured in PAYMENT_QUESTIONS."""
+    answers = answers or {}
+    questions = [
+        {"1": fid, "2": qtext, "3": str(answers.get(fid, default))}
+        for fid, qtext, default in PAYMENT_QUESTIONS
+    ]
+    return _appeal_body(
+        cfg, customer_id, questions,
+        tag_primary if tag_primary is not None else APPEAL_PAYMENT_TAG_IDS_PRIMARY,
+        tag_secondary if tag_secondary is not None else APPEAL_PAYMENT_TAG_IDS_SECONDARY,
+        drapt=drapt,
+    )
 
 
 _ERROR_CODE_RX = re.compile(
@@ -448,13 +546,19 @@ def classify(http_status: int, body: str) -> tuple[str, str]:
 
 def submit_one(session: requests.Session, cookies: dict, cfg: dict, customer_id: str,
                answer_changes: str = "yes", answer_details: str = "yes",
-               tag_primary: list = None, tag_secondary: list = None):
+               tag_primary: list = None, tag_secondary: list = None,
+               drapt: str = "", extras: dict = None,
+               payment_answers: dict = None):
     url = APPEAL_URL_TMPL.format(authuser=cfg["authuser"], fsid=cfg["f_sid"])
-    r = session.post(url, headers=appeal_headers(cfg, customer_id),
-                     cookies=cookies,
-                     data=appeal_body(cfg, customer_id, answer_changes,
-                                      answer_details, tag_primary, tag_secondary),
-                     timeout=30)
+    if payment_answers is not None:
+        # "Suspicious Payment Activity" questionnaire form.
+        data = appeal_body_payment(cfg, customer_id, payment_answers,
+                                   tag_primary, tag_secondary, drapt=drapt)
+    else:
+        data = appeal_body(cfg, customer_id, answer_changes, answer_details,
+                           tag_primary, tag_secondary, drapt=drapt)
+    r = session.post(url, headers=appeal_headers(cfg, customer_id, extras),
+                     cookies=cookies, data=data, timeout=30)
     tag, details = classify(r.status_code, r.text)
     return r.status_code, tag, details, r.text[:400].replace("\n", " ")
 
@@ -482,6 +586,13 @@ def main() -> None:
     here = data_dir()
     cookies = load_cookies(here / "cookie.txt")
     session = requests.Session()
+
+    # Pick up DRAPT + extra Chrome headers that the UI captured from a real
+    # cURL. Empty when the user hasn't passed 2FA in this session yet.
+    _session_drapt, _session_extras_headers = load_session_extras()
+    if _session_drapt or _session_extras_headers:
+        print(f"  session extras: DRAPT={'yes' if _session_drapt else 'no'}, "
+              f"headers={len(_session_extras_headers)}")
 
     print("Step 1/3  Discovering session from cookies...")
     cfg = discover_session(session, cookies, args.authuser, args.mcc)
@@ -542,7 +653,8 @@ def main() -> None:
         try:
             code, tag, details, snippet = submit_one(
                 session, cookies, cfg, cid,
-                args.answer_changes, args.answer_details)
+                args.answer_changes, args.answer_details,
+                drapt=_session_drapt, extras=_session_extras_headers)
             label = f"{tag} ({details})" if details else tag
             print(f"[{i}/{len(targets)}] {label:<32} {cid}  ({name})  http={code}")
             results.append({"customer_id": cid, "name": name,

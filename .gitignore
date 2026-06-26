@@ -2,6 +2,7 @@
 cookie.txt
 *.cookies
 .env
+session_extras.json   # live DRAPT + browser-validation headers
 
 # Runtime data
 appeal_results.json
