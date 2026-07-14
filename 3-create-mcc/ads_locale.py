@@ -156,7 +156,7 @@ CURRENCIES: list[tuple[str, str]] = [
 
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+      "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
 
 
 def _tz_headers(cfg: dict, mcc_ocid: str, extras: dict = None) -> dict:
@@ -266,7 +266,7 @@ def detect_recaptcha_sitekey(session: requests.Session, cookies: dict,
          multiple times; base64 noise that happens to match is a one-off).
     """
     ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+          "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
 
     accounts_url = (
         f"https://ads.google.com/aw/accounts?ocid={cfg['manager_customer_id']}"

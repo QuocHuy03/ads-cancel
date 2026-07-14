@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "BM Ads Account Setup",
+  "version": "0.1.0",
+  "description": "List linked accounts and create new Google Ads accounts from Business Manager's linkedapps page.",
+  "permissions": ["storage", "activeTab", "scripting", "webRequest"],
+  "host_permissions": ["https://business.google.com/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "BM Ads Account Setup"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}

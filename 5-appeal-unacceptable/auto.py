@@ -1,23 +1,6 @@
 """
-AdsCancel — one-shot bulk re-appeal for Google Ads MCC sub-accounts
-that were suspended for "Circumventing systems: Multiple account abuse".
-
-Workflow (single command):
-    1. Read cookie.txt (paste from a logged-in browser).
-    2. Auto-discover __u / __c / __lu / manager_customer_id / f.sid / xsrf
-       by fetching https://ads.google.com/aw/accounts.
-    3. List every sub-account under the user's default MCC.
-    4. Filter to leaves with ui_account_status == 2 and a descriptive_name
-       starting with "MCC_Child_" (the Multi-account-abuse cohort).
-    5. POST AccountSuspensionAppealService.Submit for each one.
-    6. Log results to appeal_results.json.
-
-Usage:
-    python auto.py                 # do everything, with prompt
-    python auto.py --yes           # skip prompt
-    python auto.py --dry-run       # show what would be sent, no POST
-    python auto.py --limit 5       # process only first 5 (smoke test)
-    python auto.py --ids ID1,ID2   # target specific customer IDs
+AdsCancel — one-shot bulk appeal for Google Ads sub-accounts suspended for
+"Unacceptable business practices policy" (16-question form).
 """
 
 import argparse
@@ -38,25 +21,30 @@ import requests
 NAME_PREFIX = ""             # empty = no name filter (default tick everything)
 STATUS_TARGET = 2            # ui_account_status: 2 = policy/abuse-suspended
 
-# "Suspicious Payment Activity" suspensions use this tag set + the longer
-# questionnaire (see appeal_body_payment / PAYMENT_QUESTIONS below).
-APPEAL_PAYMENT_TAG_IDS_PRIMARY   = [193]  # __ar.1.9
-APPEAL_PAYMENT_TAG_IDS_SECONDARY = [3]    # __ar.1.13
+# "Unacceptable business practices policy" suspension — captured tag set
+# and 16-question form. Note the field order differs from the unpaid
+# variant and there's no inputSampleKeywords.
+APPEAL_UNACCEPTABLE_TAG_IDS_PRIMARY   = [239, 255, 46]  # __ar.1.9
+APPEAL_UNACCEPTABLE_TAG_IDS_SECONDARY = [11, 5]         # __ar.1.13
+APPEAL_UNACCEPTABLE_ACTIVITY_ID       = "3428526446473199"
 
-# (field_id, question_text, default_answer) captured from a real browser submit.
-# question_text must match exactly what the Ads UI sends in __ar.2[*].2.
-PAYMENT_QUESTIONS = [
-    ("inputCountries",                 "Which country will the business run ads in?",                  "United States"),
-    ("inputBusinessModel",             "What does your organization do?",                              ""),
-    ("isAdvertisingOwnBusiness",       "Are you the owner or a direct employee of your organization?", "true"),
-    ("inputDomain",                    "What's your organization's website?",                          ""),
-    ("isBusinessModelChanged",         "Has your organization changed in the last 3 days?",            "false"),
-    ("isUsingAffiliatedMarketing",     "Is your organization part of an affiliate program?",           "false"),
-    ("isHavingMultipleGoogleAccounts", "Do you have multiple google accounts?",                        "false"),
-    ("isManagedByDifferentOrganization","Is the business managed by a different organization?",         "false"),
-    ("inputWhoOwnsPaymentInstrument",  "Who pays for this account?",                                   "me"),
-    ("inputPaymentOption",             "How do you pay for Google Ads?",                               "card"),
-    ("lastPaymentDate",                "When was your last payment?",                                  ""),
+UNACCEPTABLE_QUESTIONS = [
+    ("inputCountries",                     "Which country will the business run ads in?",                                                     "united states"),
+    ("inputBusinessModel",                 "What does your organization do?",                                                                 ""),
+    ("isAdvertisingOwnBusiness",           "Are you the owner or a direct employee of your organization?",                                    "true"),
+    ("inputDomain",                        "What's your organization's website?",                                                             ""),
+    ("isBusinessModelChanged",             "Has your organization changed in the last 3 days?",                                               "false"),
+    ("isUsingAffiliatedMarketing",         "Is your organization part of an affiliate program?",                                              "false"),
+    ("isHavingMultipleGoogleAccounts",     "Do you have multiple google accounts?",                                                           "false"),
+    ("isManagedByDifferentOrganization",   "Is the business managed by a different organization?",                                            "false"),
+    ("inputWhoOwnsPaymentInstrument",      "Who pays for this account?",                                                                      "me"),
+    ("inputPaymentOption",                 "How do you pay for Google Ads?",                                                                  "card"),
+    ("lastPaymentDate",                    "When was your last payment?",                                                                     ""),
+    ("isOrganizationOwningWebsite",        "Does your organization own the website?",                                                         "false"),
+    ("isWebsiteRedirecting",               "Does your website redirect to another website?",                                                  "false"),
+    ("isDirectRelationshipWithOtherBrands","Does your business have a direct relationship with the other brands shown on its websites?",     "false"),
+    ("inputAnyOtherInfoNeeded",            "Is there any other information we need to know about you or your organization?",                  "no"),
+    ("isDomainTakenOverOrCompromised",     "Was your organization's website hacked?",                                                         "false"),
 ]
 
 DEFAULT_DELAY = 1.5
@@ -464,54 +452,23 @@ def _appeal_body(cfg: dict, customer_id: str, questions: list,
     return urlencode(body)
 
 
-# Simple "yes/yes" re-appeal (2 questions) — reached from /aw/preferences.
-# Captured success used these tag ids.
-APPEAL_SIMPLE_TAG_IDS_PRIMARY   = [14]   # __ar.1.9
-APPEAL_SIMPLE_TAG_IDS_SECONDARY = [3]    # __ar.1.13
-# activityId captured from a live cURL against Ads UI. Google rotates these
-# occasionally — refresh from a new cURL if Submit starts rejecting.
-APPEAL_SIMPLE_ACTIVITY_ID = "2884069615762978"
-
-
-def appeal_body_simple(cfg: dict, customer_id: str,
-                       answer_changes: str = "yes", answer_details: str = "yes",
-                       tag_primary: list = None, tag_secondary: list = None,
-                       drapt: str = "") -> str:
-    """Short 2-question re-appeal submitted from the Account Preferences page."""
-    questions = [
-        {"1": "inputChangesFromLastAppeal",
-         "2": "What changes have you made to your account or payments since the last appeal?",
-         "3": answer_changes},
-        {"1": "inputFurtherDetailsSinceLastAppeal",
-         "2": "Is there any other info that wasn't included in the last appeal?",
-         "3": answer_details},
-    ]
-    return _appeal_body(
-        cfg, customer_id, questions,
-        tag_primary if tag_primary is not None else APPEAL_SIMPLE_TAG_IDS_PRIMARY,
-        tag_secondary if tag_secondary is not None else APPEAL_SIMPLE_TAG_IDS_SECONDARY,
-        drapt=drapt, place="/aw/preferences",
-        activity_id=APPEAL_SIMPLE_ACTIVITY_ID,
-    )
-
-
-def appeal_body_payment(cfg: dict, customer_id: str, answers: dict = None,
-                        tag_primary: list = None, tag_secondary: list = None,
-                        drapt: str = "") -> str:
-    """"Suspicious Payment Activity" appeal form (the longer questionnaire).
-
-    `answers` maps field_id -> answer; any field omitted falls back to the
-    default captured in PAYMENT_QUESTIONS."""
+def _questions_from_template(template: list, answers: dict) -> list:
     answers = answers or {}
-    questions = [
+    return [
         {"1": fid, "2": qtext, "3": str(answers.get(fid, default))}
-        for fid, qtext, default in PAYMENT_QUESTIONS
+        for fid, qtext, default in template
     ]
+
+
+def appeal_body_unacceptable(cfg: dict, customer_id: str, answers: dict = None,
+                             tag_primary: list = None, tag_secondary: list = None,
+                             drapt: str = "") -> str:
+    """Unacceptable business practices policy (16 questions)."""
     return _appeal_body(
-        cfg, customer_id, questions,
-        tag_primary if tag_primary is not None else APPEAL_PAYMENT_TAG_IDS_PRIMARY,
-        tag_secondary if tag_secondary is not None else APPEAL_PAYMENT_TAG_IDS_SECONDARY,
-        drapt=drapt,
+        cfg, customer_id, _questions_from_template(UNACCEPTABLE_QUESTIONS, answers),
+        tag_primary if tag_primary is not None else APPEAL_UNACCEPTABLE_TAG_IDS_PRIMARY,
+        tag_secondary if tag_secondary is not None else APPEAL_UNACCEPTABLE_TAG_IDS_SECONDARY,
+        drapt=drapt, activity_id=APPEAL_UNACCEPTABLE_ACTIVITY_ID,
     )
 
 
@@ -560,24 +517,14 @@ def classify(http_status: int, body: str) -> tuple[str, str]:
 
 
 def submit_one(session: requests.Session, cookies: dict, cfg: dict, customer_id: str,
-               payment_answers: dict = None, simple_answers: dict = None,
+               answers: dict = None,
                tag_primary: list = None, tag_secondary: list = None,
                drapt: str = "", extras: dict = None):
-    """Submit an appeal. With `simple_answers` -> short yes/yes form from the
-    Preferences page; otherwise the 'Suspicious Payment Activity' questionnaire."""
+    """Submit the 'Unacceptable business practices' 16-question appeal."""
     url = APPEAL_URL_TMPL.format(authuser=cfg["authuser"], fsid=cfg["f_sid"])
-    if simple_answers is not None:
-        data = appeal_body_simple(
-            cfg, customer_id,
-            simple_answers.get("changes", "yes"),
-            simple_answers.get("details", "yes"),
-            tag_primary, tag_secondary, drapt=drapt)
-        place = "/aw/preferences"
-    else:
-        data = appeal_body_payment(cfg, customer_id, payment_answers or {},
-                                   tag_primary, tag_secondary, drapt=drapt)
-        place = "/aw/overview"
-    r = session.post(url, headers=appeal_headers(cfg, customer_id, extras, place),
+    data = appeal_body_unacceptable(cfg, customer_id, answers or {},
+                                    tag_primary, tag_secondary, drapt=drapt)
+    r = session.post(url, headers=appeal_headers(cfg, customer_id, extras, "/aw/overview"),
                      cookies=cookies, data=data, timeout=30)
     tag, details = classify(r.status_code, r.text)
     return r.status_code, tag, details, r.text[:400].replace("\n", " ")
@@ -597,10 +544,6 @@ def main() -> None:
     p.add_argument("--authuser", default="0")
     p.add_argument("--mcc", default="",
                    help="Force a specific MCC customer_id (when the account has many).")
-    p.add_argument("--answer-changes", default="yes",
-                   help="Reply to 'What changes have you made...?'")
-    p.add_argument("--answer-details", default="yes",
-                   help="Reply to 'Is there any other info...?'")
     args = p.parse_args()
 
     here = data_dir()
@@ -671,9 +614,9 @@ def main() -> None:
             results.append({"customer_id": cid, "name": name, "tag": "dry-run"})
             continue
         try:
+            # CLI uses UNPAID_QUESTIONS defaults — override answers via UI.
             code, tag, details, snippet = submit_one(
-                session, cookies, cfg, cid,
-                args.answer_changes, args.answer_details,
+                session, cookies, cfg, cid, answers=None,
                 drapt=_session_drapt, extras=_session_extras_headers)
             label = f"{tag} ({details})" if details else tag
             print(f"[{i}/{len(targets)}] {label:<32} {cid}  ({name})  http={code}")

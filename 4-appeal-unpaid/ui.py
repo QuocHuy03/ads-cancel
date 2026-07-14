@@ -11,14 +11,14 @@ import threading
 import time
 
 import requests
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QDate, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
-    QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-    QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit,
+    QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
+    QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+    QPushButton, QSpinBox, QSplitter, QStatusBar, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 import auto   # reuse all the networking logic
@@ -76,22 +76,19 @@ class SubmitWorker(QThread):
     done = pyqtSignal()
 
     def __init__(self, cookies: dict, cfg: dict, targets: list, delay: float,
-                 answer_changes: str = "yes", answer_details: str = "yes",
                  threads: int = 1,
                  tag_primary: list = None, tag_secondary: list = None,
-                 full_answers: dict = None):
+                 mode: str = "unpaid", answers: dict = None):
         super().__init__()
         self.cookies = cookies
         self.cfg = cfg
         self.targets = targets   # list of (row, customer_id, name)
         self.delay = delay
-        self.answer_changes = answer_changes
-        self.answer_details = answer_details
         self.threads = max(1, int(threads))
         self.tag_primary = tag_primary
         self.tag_secondary = tag_secondary
-        # None -> short re-appeal; dict -> 13-question first-appeal form.
-        self.full_answers = full_answers
+        self.mode = mode
+        self.answers = answers or {}
         self._stop = False
 
     def stop(self):
@@ -119,15 +116,16 @@ class SubmitWorker(QThread):
                     i = counter[0]
 
                 try:
-                    # Pull DRAPT + captured Chrome headers, and route to the
-                    # right form based on whether the UI configured full_answers.
+                    # Pull the DRAPT + Chrome session headers the create-MCC UI
+                    # already captures into session_extras.json so this appeal
+                    # path mirrors a real browser request as well.
                     _drapt, _extras = auto.load_session_extras()
                     code, tag, details, snippet = auto.submit_one(
                         session, self.cookies, self.cfg, cid,
-                        self.answer_changes, self.answer_details,
-                        self.tag_primary, self.tag_secondary,
-                        drapt=_drapt, extras=_extras,
-                        full_answers=self.full_answers)
+                        mode=self.mode, answers=self.answers,
+                        tag_primary=self.tag_primary,
+                        tag_secondary=self.tag_secondary,
+                        drapt=_drapt, extras=_extras)
                     label = f"{tag} ({details})" if details else tag
                     self.log.emit(
                         f"[{i}/{total}] {label:<32} {cid} ({name}) http={code}"
@@ -202,16 +200,28 @@ def infer_type(acc: dict) -> str:
     return "—"
 
 
+# field_ids in the unpaid-balance form whose answer is a yes/no boolean.
+UNPAID_BOOL_FIELDS = {
+    "isAdvertisingOwnBusiness", "isBusinessModelChanged",
+    "isUsingAffiliatedMarketing", "isHavingMultipleGoogleAccounts",
+    "isOrganizationOwningWebsite", "isWebsiteRedirecting",
+    "isManagedByDifferentOrganization",
+    "isDirectRelationshipWithOtherBrands", "isDomainTakenOverOrCompromised",
+}
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AdsCancel — @huyit32")
+        self.setWindowTitle("Ads Cancel - Unpaid Balance - @huyit32")
         self.resize(1100, 760)
 
         self.cookies = {}
         self.cfg = None
         self.accounts = []
         self.submit_worker = None
+        # Guards itemChanged spam while we bulk-fill / bulk-toggle the table.
+        self._populating = False
         # customer_id -> last tag from previous runs (loaded from appeal_results.json).
         self.last_results: dict[str, str] = {}
 
@@ -269,65 +279,54 @@ class MainWindow(QMainWindow):
         row1.addStretch()
         v.addLayout(row1)
 
-        # Form-mode picker — the abuse endpoint accepts two shapes: the short
-        # 2-question re-appeal (default) or the 13-question first-appeal form.
+        # Form-variant picker — unpaid balance surfaces two shapes: a full
+        # 17-question form (default) and an 11-question payment-shaped form
+        # tagged [46]/[5]. Changing this auto-fills the tag defaults and
+        # swaps which answer panel is visible.
         row_mode = QHBoxLayout()
-        row_mode.addWidget(QLabel("Form:"))
-        self.form_mode = QComboBox()
-        self.form_mode.addItem("Short re-appeal (2 questions)", "short")
-        self.form_mode.addItem("Full first-appeal (13 questions)", "full")
-        self.form_mode.currentIndexChanged.connect(self._on_form_mode_changed)
-        row_mode.addWidget(self.form_mode)
+        row_mode.addWidget(QLabel("Form variant:"))
+        self.mode_picker = QComboBox()
+        for m in auto.UNPAID_MODES:
+            self.mode_picker.addItem(auto.UNPAID_MODE_INFO[m]["label"], m)
+        self.mode_picker.currentIndexChanged.connect(self._on_mode_changed)
+        row_mode.addWidget(self.mode_picker, stretch=1)
         row_mode.addStretch()
         v.addLayout(row_mode)
 
-        # Short re-appeal answers row — the two free-text replies.
-        self.short_row_widget = QWidget()
-        row_ans = QHBoxLayout(self.short_row_widget)
-        row_ans.setContentsMargins(0, 0, 0, 0)
-        row_ans.addWidget(QLabel("Changes since last appeal:"))
-        self.answer_changes_edit = QLineEdit("yes")
-        self.answer_changes_edit.setMinimumWidth(180)
-        row_ans.addWidget(self.answer_changes_edit, stretch=1)
-        row_ans.addWidget(QLabel("Further details:"))
-        self.answer_details_edit = QLineEdit("yes")
-        self.answer_details_edit.setMinimumWidth(180)
-        row_ans.addWidget(self.answer_details_edit, stretch=1)
-        v.addWidget(self.short_row_widget)
-
-        # Full-form panel — one editable field per question in ABUSE_QUESTIONS.
-        # Hidden until the user picks "Full first-appeal" from the form picker.
-        self.full_form_group = QGroupBox("First-appeal business questionnaire")
-        full_layout = QFormLayout(self.full_form_group)
-        self.full_edits = {}   # field_id -> QLineEdit
-        for fid, qtext, default in auto.ABUSE_QUESTIONS:
-            edit = QLineEdit(default)
-            edit.setToolTip(f"__ar.2[*] field: {fid}")
-            full_layout.addRow(qtext, edit)
-            self.full_edits[fid] = edit
-        self.full_form_group.setVisible(False)
-        v.addWidget(self.full_form_group)
-
-        # Abuse-tag override row — different suspension reasons need different tag IDs.
+        # abuse_tag_ids override row. Different suspension reasons use
+        # different tag IDs. When the RPC returns
+        # "MUTATE_ERROR_ENTITY_DOES_NOT_EXIST" on field account_appeal.abuse_tag_ids,
+        # the captured tag IDs don't match the account's actual suspension
+        # reason — grab a fresh cURL from an affected account and paste the
+        # __ar.1.9 / __ar.1.13 values here.
         row_tag = QHBoxLayout()
         row_tag.addWidget(QLabel("abuse_tag_ids primary:"))
-        self.tag_primary_edit = QLineEdit("288")
-        self.tag_primary_edit.setFixedWidth(120)
+        self.tag_primary_edit = QLineEdit()
+        self.tag_primary_edit.setFixedWidth(140)
         self.tag_primary_edit.setToolTip(
-            "Comma-separated IDs sent as __ar.1.9 (abuse_tag_ids primary).\n"
-            "288 = Multi-account abuse. Other suspension reasons need different IDs."
+            "Comma-separated IDs sent as __ar.1.9.\n"
+            "238/255/46 match 'unpaid balance / future-payment concerns'.\n"
+            "If Google rejects with MUTATE_ERROR_ENTITY_DOES_NOT_EXIST on\n"
+            "'account_appeal.abuse_tag_ids', pull the correct IDs from a\n"
+            "fresh browser cURL for the exact suspension reason."
         )
         row_tag.addWidget(self.tag_primary_edit)
         row_tag.addWidget(QLabel("secondary:"))
-        self.tag_secondary_edit = QLineEdit("59")
-        self.tag_secondary_edit.setFixedWidth(120)
-        self.tag_secondary_edit.setToolTip(
-            "Comma-separated IDs sent as __ar.1.13 (abuse_tag_ids secondary).\n"
-            "59 goes with primary=288."
-        )
+        self.tag_secondary_edit = QLineEdit()
+        self.tag_secondary_edit.setFixedWidth(140)
+        self.tag_secondary_edit.setToolTip("Comma-separated IDs sent as __ar.1.13.")
         row_tag.addWidget(self.tag_secondary_edit)
         row_tag.addStretch()
         v.addLayout(row_tag)
+
+        # One collapsible group per form variant (unpaid 17Q + unpaid 11Q).
+        # Only the one matching the mode picker is visible at a time.
+        self.form_panels: dict[str, dict] = {}
+        for m in auto.UNPAID_MODES:
+            title = auto.UNPAID_MODE_INFO[m]["label"]
+            template = auto.UNPAID_MODE_INFO[m]["template"]
+            self._build_form_panel(v, m, title, template)
+        self._on_mode_changed()
 
         # Filter row
         row2 = QHBoxLayout()
@@ -388,6 +387,8 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setDefaultSectionSize(36)
         # Click the "✓" header cell to toggle every row's checkbox.
         self.table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
+        # Row checkboxes are checkable items now — one signal keeps the count live.
+        self.table.itemChanged.connect(self._on_item_changed)
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -426,10 +427,14 @@ class MainWindow(QMainWindow):
         self.summary_lbl = QLabel("0 / 0 selected")
         row3.addWidget(self.summary_lbl)
 
-        self.btn_submit = QPushButton("Submit appeals for checked")
-        self.btn_submit.setStyleSheet("background-color:#1a73e8; color:white; padding:8px 16px;")
-        self.btn_submit.clicked.connect(self.submit_checked)
-        row3.addWidget(self.btn_submit)
+        self.btn_submit_unpaid = QPushButton("Submit unpaid-balance appeal")
+        self.btn_submit_unpaid.setStyleSheet("background-color:#1a73e8; color:white; padding:8px 16px;")
+        self.btn_submit_unpaid.setToolTip(
+            "Unpaid-balance / future-payment-concerns questionnaire\n"
+            "(17 questions, one shared set of answers applied to every checked account)."
+        )
+        self.btn_submit_unpaid.clicked.connect(self.submit_checked_unpaid)
+        row3.addWidget(self.btn_submit_unpaid)
 
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.clicked.connect(self.stop_submit)
@@ -439,6 +444,73 @@ class MainWindow(QMainWindow):
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Paste cookie -> Save -> Scan")
+
+    def _build_form_panel(self, parent_layout, mode: str, title: str,
+                          template: list) -> None:
+        """Add a collapsible group box for one appeal-form template."""
+        box = QGroupBox(title + "  (one set, applied to every checked account)")
+        box.setCheckable(True)
+        box.setChecked(True)
+        form = QFormLayout(box)
+        widgets: dict[str, object] = {}
+        for fid, qtext, default in template:
+            if fid in UNPAID_BOOL_FIELDS:
+                w = QComboBox(); w.addItems(["true", "false"])
+                w.setCurrentText(default if default in ("true", "false") else "false")
+            elif fid == "inputWhoOwnsPaymentInstrument":
+                w = QComboBox(); w.addItems(["me", "someone_else"])
+                w.setCurrentText(default or "me")
+            elif fid == "inputPaymentOption":
+                w = QComboBox(); w.addItems(["card", "bank", "other"])
+                w.setCurrentText(default or "card")
+            elif fid == "lastPaymentDate":
+                w = QDateEdit()
+                w.setCalendarPopup(True)
+                w.setDisplayFormat("yyyy-MM-dd")
+                w.setDate(QDate.currentDate())
+                w.setMaximumDate(QDate.currentDate())
+            else:
+                w = QLineEdit(default)
+                if fid == "inputDomain":
+                    w.setPlaceholderText("https://example.com/")
+                elif fid == "inputBusinessModel":
+                    w.setPlaceholderText("What the business does")
+                elif fid == "inputSampleKeywords":
+                    w.setPlaceholderText("keyword1, keyword2, ...")
+            w.setToolTip(f"__ar.2[*] field: {fid}")
+            widgets[fid] = w
+            form.addRow(qtext, w)
+        box.toggled.connect(
+            lambda on, ws=widgets: [w.setVisible(on) for w in ws.values()]
+        )
+        parent_layout.addWidget(box)
+        self.form_panels[mode] = {"box": box, "widgets": widgets}
+
+    def _current_mode(self) -> str:
+        return self.mode_picker.currentData() or "unpaid"
+
+    def _answers_from_panel(self, mode: str) -> dict:
+        panel = self.form_panels.get(mode)
+        if not panel:
+            return {}
+        out = {}
+        for fid, w in panel["widgets"].items():
+            if isinstance(w, QComboBox):
+                out[fid] = w.currentText()
+            elif isinstance(w, QDateEdit):
+                d = w.date()
+                out[fid] = f"{d.year()}-{d.month()}-{d.day()}"
+            else:
+                out[fid] = w.text().strip()
+        return out
+
+    def _on_mode_changed(self) -> None:
+        mode = self._current_mode()
+        tp, ts = auto.UNPAID_MODE_INFO[mode]["default_tags"]
+        self.tag_primary_edit.setText(",".join(str(x) for x in tp))
+        self.tag_secondary_edit.setText(",".join(str(x) for x in ts))
+        for m, panel in self.form_panels.items():
+            panel["box"].setVisible(m == mode)
 
     # ---- helpers ----
     def append_log(self, msg: str):
@@ -570,6 +642,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No cookie", "Save cookie first.")
             return
         self.btn_scan.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.statusBar().showMessage(
+            "Scanning… large MCCs take a while to download + parse; please wait."
+        )
         self.append_log("--- Scanning ---")
 
         # Accept either a raw customer_id or a full Ads URL containing ocid=…
@@ -595,6 +671,7 @@ class MainWindow(QMainWindow):
 
     def on_mccs_needed(self, mccs: list):
         """Multiple MCCs available — let the user pick one, then re-scan."""
+        QApplication.restoreOverrideCursor()
         self.btn_scan.setEnabled(True)
         items = [f"{ocid}  {label}".strip() for ocid, label in mccs]
         choice, ok = QInputDialog.getItem(
@@ -617,11 +694,13 @@ class MainWindow(QMainWindow):
         self.scan()
 
     def on_scan_failed(self, msg: str):
+        QApplication.restoreOverrideCursor()
         self.btn_scan.setEnabled(True)
         self.append_log(f"SCAN FAILED: {msg}")
         QMessageBox.critical(self, "Scan failed", msg)
 
     def on_scan_done(self, cfg: dict, accounts: list):
+        QApplication.restoreOverrideCursor()
         self.btn_scan.setEnabled(True)
         self.cfg = cfg
         self.accounts = accounts
@@ -634,7 +713,7 @@ class MainWindow(QMainWindow):
             if (a.get("descriptive_name") or "").startswith("(your account)")
         ]
         if single_rows and len(single_rows) == len(accounts):
-            self.table.cellWidget(single_rows[0], 0).setChecked(True)
+            self._set_row_checked(single_rows[0], True)
             msg = (
                 "Single-account mode: no MCC sub-accounts found. "
                 "Primary customer (__c) added as target."
@@ -655,39 +734,53 @@ class MainWindow(QMainWindow):
             )
 
     def _populate_table(self, accounts: list):
-        self.table.setRowCount(0)
-        for a in accounts:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
+        # Building thousands of rows is the slowest part of a scan. Freeze
+        # painting + signals while we fill the model so the GUI doesn't lock
+        # up ("Not Responding") on large MCCs, then re-enable once at the end.
+        self._populating = True
+        self.table.setUpdatesEnabled(False)
+        self.table.setSortingEnabled(False)
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(accounts))
+            for r, a in enumerate(accounts):
+                # Checkable item instead of a per-row QCheckBox widget — an
+                # order of magnitude cheaper to create and keeps scrolling smooth.
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled
+                             | Qt.ItemIsSelectable)
+                chk.setCheckState(Qt.Unchecked)
+                self.table.setItem(r, 0, chk)
 
-            chk = QCheckBox()
-            chk.stateChanged.connect(self._update_summary)
-            self.table.setCellWidget(r, 0, chk)
+                status = a.get("ui_account_status")
+                status_label = STATUS_LABEL.get(status, str(status) if status else "")
+                kind = infer_type(a)
 
-            status = a.get("ui_account_status")
-            status_label = STATUS_LABEL.get(status, str(status) if status else "")
-            kind = infer_type(a)
+                self.table.setItem(r, 1, QTableWidgetItem(str(a.get("customer_id") or "")))
+                self.table.setItem(r, 2, QTableWidgetItem(a.get("descriptive_name") or ""))
+                self.table.setItem(r, 3, QTableWidgetItem(status_label))
+                type_item = QTableWidgetItem(kind)
+                color = TYPE_COLORS.get(kind)
+                if color:
+                    type_item.setBackground(color)
+                self.table.setItem(r, 4, type_item)
+                self.table.setItem(r, 5, QTableWidgetItem("yes" if a.get("is_manager") else ""))
 
-            self.table.setItem(r, 1, QTableWidgetItem(str(a.get("customer_id") or "")))
-            self.table.setItem(r, 2, QTableWidgetItem(a.get("descriptive_name") or ""))
-            self.table.setItem(r, 3, QTableWidgetItem(status_label))
-            type_item = QTableWidgetItem(kind)
-            color = TYPE_COLORS.get(kind)
-            if color:
-                type_item.setBackground(color)
-            self.table.setItem(r, 4, type_item)
-            self.table.setItem(r, 5, QTableWidgetItem("yes" if a.get("is_manager") else ""))
-
-            # Pre-fill the "tag" column from prior runs so the user can see
-            # at a glance which accounts have already been re-appealed.
-            cid_str = str(a.get("customer_id") or "")
-            prior_tag = self.last_results.get(cid_str, "")
-            tag_item = QTableWidgetItem(prior_tag)
-            tcolor = TAG_COLORS.get(prior_tag)
-            if tcolor:
-                tag_item.setBackground(tcolor)
-            self.table.setItem(r, 6, tag_item)
-            self.table.setItem(r, 7, QTableWidgetItem(""))
+                # Pre-fill the "tag" column from prior runs so the user can see
+                # at a glance which accounts have already been re-appealed.
+                cid_str = str(a.get("customer_id") or "")
+                prior_tag = self.last_results.get(cid_str, "")
+                tag_item = QTableWidgetItem(prior_tag)
+                tcolor = TAG_COLORS.get(prior_tag)
+                if tcolor:
+                    tag_item.setBackground(tcolor)
+                self.table.setItem(r, 6, tag_item)
+                self.table.setItem(r, 7, QTableWidgetItem(""))
+        finally:
+            self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
+            self._populating = False
+        self._update_summary()
 
     def apply_filter(self):
         prefix = self.prefix_edit.text()
@@ -695,6 +788,8 @@ class MainWindow(QMainWindow):
         skip_done = self.skip_done_chk.isChecked()
         skip_set = {"OK", "PENDING"} if skip_done else set()
         n = skipped = 0
+        self._populating = True
+        self.table.blockSignals(True)
         for r in range(self.table.rowCount()):
             a = self.accounts[r]
             cid = str(a.get("customer_id") or "")
@@ -705,28 +800,43 @@ class MainWindow(QMainWindow):
             if match and prior in skip_set:
                 match = False
                 skipped += 1
-            chk: QCheckBox = self.table.cellWidget(r, 0)
-            chk.setChecked(match)
+            self._set_row_checked(r, match)
             if match:
                 n += 1
+        self.table.blockSignals(False)
+        self._populating = False
+        self._update_summary()
         msg = f"Filter: status={status}, prefix={prefix!r} -> {n} matches"
         if skip_done and skipped:
             msg += f"  (skipped {skipped} already OK/PENDING)"
         self.append_log(msg)
 
-    def _on_form_mode_changed(self):
-        mode = self.form_mode.currentData()
-        self.short_row_widget.setVisible(mode == "short")
-        self.full_form_group.setVisible(mode == "full")
+    def _is_row_checked(self, r: int) -> bool:
+        it = self.table.item(r, 0)
+        return it is not None and it.checkState() == Qt.Checked
+
+    def _set_row_checked(self, r: int, v: bool):
+        it = self.table.item(r, 0)
+        if it is not None:
+            it.setCheckState(Qt.Checked if v else Qt.Unchecked)
 
     def _set_all_checked(self, v: bool):
+        self._populating = True
+        self.table.blockSignals(True)
         for r in range(self.table.rowCount()):
-            self.table.cellWidget(r, 0).setChecked(v)
+            self._set_row_checked(r, v)
+        self.table.blockSignals(False)
+        self._populating = False
+        self._update_summary()
 
     def _invert_checked(self):
+        self._populating = True
+        self.table.blockSignals(True)
         for r in range(self.table.rowCount()):
-            box = self.table.cellWidget(r, 0)
-            box.setChecked(not box.isChecked())
+            self._set_row_checked(r, not self._is_row_checked(r))
+        self.table.blockSignals(False)
+        self._populating = False
+        self._update_summary()
 
     def _on_header_clicked(self, col: int):
         # Click the "✓" column header to toggle every row.
@@ -735,89 +845,95 @@ class MainWindow(QMainWindow):
         total = self.table.rowCount()
         if total == 0:
             return
-        checked = sum(1 for r in range(total)
-                      if self.table.cellWidget(r, 0).isChecked())
+        checked = sum(1 for r in range(total) if self._is_row_checked(r))
         # All ticked already → untick all; otherwise tick all.
         self._set_all_checked(checked != total)
 
+    def _on_item_changed(self, item):
+        # A row checkbox toggled — refresh the count (skip during bulk fills).
+        if not getattr(self, "_populating", False) and item.column() == 0:
+            self._update_summary()
+
     def _update_summary(self):
         total = self.table.rowCount()
-        n = sum(1 for r in range(total)
-                if self.table.cellWidget(r, 0).isChecked())
+        n = sum(1 for r in range(total) if self._is_row_checked(r))
         self.summary_lbl.setText(f"{n} / {total} selected")
 
-    def submit_checked(self):
-        if not self.cfg:
-            QMessageBox.warning(self, "Not scanned", "Scan first.")
-            return
+    def _collect_targets(self):
+        """Rows ticked -> [(row, cid, name)], clearing their result columns."""
         targets = []
         for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, 0).isChecked():
+            if self._is_row_checked(r):
                 cid = self.table.item(r, 1).text()
                 name = self.table.item(r, 2).text()
-                # clear previous result columns
                 self.table.item(r, 6).setText("")
                 self.table.item(r, 7).setText("")
                 targets.append((r, cid, name))
+        return targets
+
+    def submit_checked_unpaid(self):
+        """Submit the unpaid-balance 17-question form for every checked row,
+        using one shared set of answers."""
+        if not self.cfg:
+            QMessageBox.warning(self, "Not scanned", "Scan first.")
+            return
+        targets = self._collect_targets()
         if not targets:
             QMessageBox.information(self, "Empty", "No rows checked.")
             return
-        delay = self.delay_spin.value()
-        threads = self.threads_spin.value()
-        eta = len(targets) * delay / 60 / max(1, threads)
-        ans = QMessageBox.question(
-            self, "Confirm",
-            f"Submit appeals for {len(targets)} accounts "
-            f"with {threads} thread(s)?  (~{eta:.1f} min)",
-        )
-        if ans != QMessageBox.Yes:
-            return
 
-        self.append_log(f"--- Submitting {len(targets)} appeals ({threads} threads) ---")
-        self.btn_submit.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.btn_scan.setEnabled(False)
-
-        ans_changes = self.answer_changes_edit.text().strip() or "yes"
-        ans_details = self.answer_details_edit.text().strip() or "yes"
+        mode = self._current_mode()
+        answers = self._answers_from_panel(mode)
 
         def parse_int_csv(s: str, fallback: list) -> list:
             try:
                 v = [int(x) for x in s.replace(" ", "").split(",") if x]
-                return v or fallback
+                return v or list(fallback)
             except ValueError:
-                return fallback
-        tag_primary = parse_int_csv(self.tag_primary_edit.text(), [288])
-        tag_secondary = parse_int_csv(self.tag_secondary_edit.text(), [59])
+                return list(fallback)
+        default_p, default_s = auto.UNPAID_MODE_INFO[mode]["default_tags"]
+        tag_primary   = parse_int_csv(self.tag_primary_edit.text(),   default_p)
+        tag_secondary = parse_int_csv(self.tag_secondary_edit.text(), default_s)
 
-        # In full-form mode, snapshot every field into a dict so the worker
-        # can build the 13-question payload. None means "use short re-appeal".
-        full_answers = None
-        if self.form_mode.currentData() == "full":
-            full_answers = {fid: edit.text().strip()
-                            for fid, edit in self.full_edits.items()}
+        delay = self.delay_spin.value()
+        threads = self.threads_spin.value()
+        eta = len(targets) * delay / 60 / max(1, threads)
+        label_txt = auto.UNPAID_MODE_INFO[mode]["label"]
+        ans = QMessageBox.question(
+            self, f"Confirm — {label_txt}",
+            f"Submit '{label_txt}' for {len(targets)} accounts "
+            f"with {threads} thread(s)?  (~{eta:.1f} min)\n\n"
+            f"website={answers.get('inputDomain') or '(empty)'}  "
+            f"country={answers.get('inputCountries')}\n"
+            f"abuse_tag_ids primary={tag_primary} secondary={tag_secondary}",
+        )
+        if ans != QMessageBox.Yes:
+            return
 
-        if full_answers is not None:
-            self.append_log(
-                f"Mode=FULL (13Q) — abuse_tag_ids primary={tag_primary} "
-                f"secondary={tag_secondary}"
-            )
-        else:
-            self.append_log(
-                f"Mode=SHORT — changes={ans_changes!r}  details={ans_details!r}  "
-                f"abuse_tag_ids primary={tag_primary} secondary={tag_secondary}"
-            )
+        self.append_log(
+            f"--- Submitting {len(targets)} appeals — mode={mode!r} "
+            f"({threads} threads) ---"
+        )
+        self.append_log(
+            f"abuse_tag_ids primary={tag_primary} secondary={tag_secondary}"
+        )
+        self.append_log(f"Answers: {answers}")
+        self._begin_submit()
         self.submit_worker = SubmitWorker(
             self.cookies, self.cfg, targets, delay,
-            ans_changes, ans_details, threads,
-            tag_primary, tag_secondary,
-            full_answers=full_answers,
+            threads=threads, mode=mode, answers=answers,
+            tag_primary=tag_primary, tag_secondary=tag_secondary,
         )
         self.submit_worker.log.connect(self.append_log)
         self.submit_worker.progress.connect(self.on_submit_progress)
         self.submit_worker.done.connect(self.on_submit_done)
         self.submit_worker.start()
-        self._results = []   # capture for json dump
+        self._results = []
+
+    def _begin_submit(self):
+        self.btn_submit_unpaid.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.btn_scan.setEnabled(False)
 
     def stop_submit(self):
         if self.submit_worker:
@@ -849,7 +965,7 @@ class MainWindow(QMainWindow):
                               "details": details, "body": body[:200]})
 
     def on_submit_done(self):
-        self.btn_submit.setEnabled(True)
+        self.btn_submit_unpaid.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_scan.setEnabled(True)
         # Append to appeal_results.json so prior history isn't lost.

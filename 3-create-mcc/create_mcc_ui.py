@@ -48,7 +48,9 @@ DEFAULT_SITE_URL = "https://ads.google.com/aw/account/new"
 CAPTCHA_RETRIES = 3
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+      "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
+# Full Chrome version referenced by the sec-ch-ua-full-version-list header.
+UA_FULL_VERSION = "150.0.7871.46"
 
 
 # ---------- network helpers ----------
@@ -59,29 +61,46 @@ def now_ms_id() -> str:
 
 def shared_headers(cfg: dict, mcc_ocid: str, extras: dict = None,
                    referer_path: str = "/aw/account/new") -> dict:
-    """Headers that mirror what Chrome sends to the MCC Mutate endpoint.
-    `extras` is a dict of any per-session header captured from the user's
-    cURL (user-context, request-context, x-client-data, etc.) — they are
-    merged in last so they win over our defaults.
-    `referer_path` defaults to /aw/account/new because that's the page the
-    Save button is on — Google rejects creates if the referer is wrong."""
+    """Mirror every header Chrome 150 sends to the MCC Mutate endpoint.
+    `extras` merges in the session-bound ones the user captured from a real
+    cURL (user-context, request-context, x-client-data, x-browser-*,
+    build-version). `referer_path` defaults to /aw/account/new because that's
+    the page the Save button is on — Google rejects creates if the referer
+    is wrong."""
+    ch_ua = (
+        '"Not;A=Brand";v="8", '
+        '"Chromium";v="150", '
+        '"Google Chrome";v="150"'
+    )
+    ch_ua_full = (
+        f'"Not;A=Brand";v="8.0.0.0", '
+        f'"Chromium";v="{UA_FULL_VERSION}", '
+        f'"Google Chrome";v="{UA_FULL_VERSION}"'
+    )
     h = {
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
-        "cache-control": "no-cache",
-        "pragma": "no-cache",
         "content-type": "application/x-www-form-urlencoded",
         "origin": "https://ads.google.com",
+        "priority": "u=1, i",
         "referer": (
             f"https://ads.google.com{referer_path}?ocid={mcc_ocid}"
             f"&ascid={mcc_ocid}&euid={cfg['login_user_id']}"
             f"&__u={cfg['user_id']}&uscid={mcc_ocid}"
             f"&__c={cfg['customer_id']}&authuser={cfg['authuser']}"
         ),
-        # Client hints that the browser always sends from Chrome 149 on Win.
-        "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+        # Full sec-ch-ua-* stanza Chrome 150 on Windows currently sends.
+        "sec-ch-ua": ch_ua,
+        "sec-ch-ua-arch": '"x86"',
+        "sec-ch-ua-bitness": '"64"',
+        "sec-ch-ua-form-factors": '"Desktop"',
+        "sec-ch-ua-full-version": f'"{UA_FULL_VERSION}"',
+        "sec-ch-ua-full-version-list": ch_ua_full,
         "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-model": '""',
         "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-platform-version": '"19.0.0"',
+        "sec-ch-ua-wow64": "?0",
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
@@ -708,6 +727,7 @@ class MainWindow(QMainWindow):
         "x-browser-channel",
         "x-browser-copyright",
         "x-browser-year",
+        "build-version",
     ]
 
     @staticmethod

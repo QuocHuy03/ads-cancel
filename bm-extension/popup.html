@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BM Ads Account Setup</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="title-block">
+      <h1>BM Ads Account Setup</h1>
+      <div class="subtitle">Session inspector · auto-create</div>
+    </div>
+    <div class="header-actions">
+      <span id="status" class="badge">idle</span>
+      <button id="btn-reload" class="icon-btn" title="Re-detect session &amp; refresh">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
+          <path d="M12 5V2L8 6l4 4V7c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 13c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 8.74A7.93 7.93 0 0 0 4 13c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <section class="who">
+    <div class="row">
+      <span class="label">Signed in</span>
+      <span id="who">—</span>
+    </div>
+    <div class="row">
+      <span class="label">Business</span>
+      <span id="biz-id" class="mono">—</span>
+    </div>
+    <div class="row">
+      <span class="label">Merchant</span>
+      <span id="mc-id" class="mono">—</span>
+    </div>
+  </section>
+
+  <section id="account-list-section" class="hidden">
+    <h2>Linked Ads accounts <span id="acct-count" class="badge">0</span></h2>
+    <div id="account-list" class="list"></div>
+  </section>
+
+  <section id="create-section" class="hidden">
+    <h2>Create new Ads account(s)</h2>
+    <label>
+      Account name pattern
+      <input id="new-name" type="text"
+             placeholder="e.g. Store {i}  |  Shop_{rand}  |  MCC {ts}">
+    </label>
+    <p class="hint">
+      Tokens: <code>{i}</code> = 1..N counter, <code>{rand}</code> = 6 ký tự
+      chữ + số, <code>{ts}</code> = timestamp giây. Không có token nào → tự
+      thêm " #{i}" khi quantity &gt; 1.
+    </p>
+    <div class="grid">
+      <label>
+        Country
+        <select id="country"></select>
+      </label>
+      <label>
+        Currency
+        <input id="currency" readonly>
+      </label>
+    </div>
+    <label>
+      Timezone (informational — Google derives from country)
+      <select id="timezone"></select>
+    </label>
+    <div class="grid">
+      <label>
+        Quantity
+        <input id="qty" type="number" min="1" max="100" value="1">
+      </label>
+      <label>
+        Delay per create (ms)
+        <input id="delay-ms" type="number" min="0" max="10000" step="100" value="1500">
+      </label>
+    </div>
+    <div class="button-row">
+      <button id="btn-stop">Stop</button>
+      <button id="btn-create" class="primary">
+        Create Ads account
+      </button>
+    </div>
+  </section>
+
+  <section class="log-section">
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>

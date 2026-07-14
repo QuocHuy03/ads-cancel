@@ -41,6 +41,32 @@ STATUS_TARGET = 2            # ui_account_status: 2 = policy/abuse-suspended
 APPEAL_ABUSE_TAG_IDS_PRIMARY   = [288]   # __ar.1.9
 APPEAL_ABUSE_TAG_IDS_SECONDARY = [59]    # __ar.1.13
 
+# activityId for the short 2-question re-appeal (older captured value —
+# still accepted). The 13-question first-appeal form uses a different id
+# captured from a fresh cURL: see APPEAL_ABUSE_FULL_ACTIVITY_ID below.
+APPEAL_ABUSE_SIMPLE_ACTIVITY_ID = "475126922029082"
+APPEAL_ABUSE_FULL_ACTIVITY_ID   = "3107931383697595"
+
+# (field_id, question_text, default_answer) captured from a real browser
+# submit of the "Multiple account abuse" *first* appeal (13 questions,
+# from /aw/overview). question_text must match exactly what the Ads UI
+# sends in __ar.2[*].2.
+ABUSE_QUESTIONS = [
+    ("inputCountries",                     "Which country will the business run ads in?",                              "united states"),
+    ("inputBusinessModel",                 "What does your organization do?",                                          ""),
+    ("isAdvertisingOwnBusiness",           "Are you the owner or a direct employee of your organization?",             "true"),
+    ("inputDomain",                        "What's your organization's website?",                                      ""),
+    ("isBusinessModelChanged",             "Has your organization changed in the last 3 days?",                        "false"),
+    ("isUsingAffiliatedMarketing",         "Is your organization part of an affiliate program?",                       "false"),
+    ("isHavingMultipleGoogleAccounts",     "Do you have multiple google accounts?",                                    "false"),
+    ("isOrganizationOwningWebsite",        "Does your organization own the website?",                                  "true"),
+    ("isDirectRelationshipWithOtherBrands","Does your business have a direct relationship with the other brands shown on its websites?", "false"),
+    ("isManagedByDifferentOrganization",   "Is the business managed by a different organization?",                     "false"),
+    ("inputAnyOtherInfoNeeded",            "Is there any other information we need to know about you or your organization?", "no"),
+    ("inputSampleKeywords",                "What are some sample keywords from your campaigns?",                       ""),
+    ("inputActiveWebsiteDuration",         "How long has your website been active?",                                   "now"),
+]
+
 DEFAULT_DELAY = 1.5
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -392,12 +418,15 @@ def appeal_headers(cfg: dict, customer_id: str, extras: dict = None) -> dict:
 
 def _appeal_body(cfg: dict, customer_id: str, questions: list,
                  tag_primary: list, tag_secondary: list,
-                 drapt: str = "") -> str:
+                 drapt: str = "",
+                 activity_id: str = APPEAL_ABUSE_SIMPLE_ACTIVITY_ID) -> str:
     """Build the urlencoded Submit body for any appeal form.
 
     `questions` is a list of {"1": field_id, "2": question_text, "3": answer}.
     `tag_primary`/`tag_secondary` are the __ar.1.9 / __ar.1.13 tag-id lists that
-    tell Google which suspension reason this appeal is for."""
+    tell Google which suspension reason this appeal is for.
+    `activity_id` is the client-side activity token — captured per-flow from
+    a real browser cURL. Short re-appeal and long first-appeal use different ids."""
     ar = {
         "1": {
             "1": str(customer_id),
@@ -419,8 +448,8 @@ def _appeal_body(cfg: dict, customer_id: str, questions: list,
         "activityContext": "AccountAppealFormSlidealog.AccountAppealFormStepper.Submit",
         "requestPriority":  "HIGH_LATENCY_SENSITIVE",
         "activityType":     "INTERACTIVE",
-        "activityId":       "475126922029082",
-        "uniqueFingerprint": f"{cfg['f_sid']}_475126922029082_1",
+        "activityId":       activity_id,
+        "uniqueFingerprint": f"{cfg['f_sid']}_{activity_id}_1",
         "previousPlace":    "/aw/overview",
         "activityName":     "AccountAppealFormSlidealog.AccountAppealFormStepper.Submit",
         "destinationPlace": "/aw/overview",
@@ -456,6 +485,27 @@ def appeal_body(cfg: dict, customer_id: str,
         tag_primary if tag_primary is not None else APPEAL_ABUSE_TAG_IDS_PRIMARY,
         tag_secondary if tag_secondary is not None else APPEAL_ABUSE_TAG_IDS_SECONDARY,
         drapt=drapt,
+    )
+
+
+def appeal_body_full(cfg: dict, customer_id: str, answers: dict = None,
+                     tag_primary: list = None, tag_secondary: list = None,
+                     drapt: str = "") -> str:
+    """"Multiple account abuse" *first* appeal (13-question business form).
+
+    Submitted from /aw/overview when the account is first suspended, before
+    a re-appeal is available. `answers` maps field_id -> answer; any field
+    omitted falls back to the default captured in ABUSE_QUESTIONS."""
+    answers = answers or {}
+    questions = [
+        {"1": fid, "2": qtext, "3": str(answers.get(fid, default))}
+        for fid, qtext, default in ABUSE_QUESTIONS
+    ]
+    return _appeal_body(
+        cfg, customer_id, questions,
+        tag_primary if tag_primary is not None else APPEAL_ABUSE_TAG_IDS_PRIMARY,
+        tag_secondary if tag_secondary is not None else APPEAL_ABUSE_TAG_IDS_SECONDARY,
+        drapt=drapt, activity_id=APPEAL_ABUSE_FULL_ACTIVITY_ID,
     )
 
 
@@ -506,11 +556,19 @@ def classify(http_status: int, body: str) -> tuple[str, str]:
 def submit_one(session: requests.Session, cookies: dict, cfg: dict, customer_id: str,
                answer_changes: str = "yes", answer_details: str = "yes",
                tag_primary: list = None, tag_secondary: list = None,
-               drapt: str = "", extras: dict = None):
-    """Submit the 'Multiple account abuse' re-appeal form."""
+               drapt: str = "", extras: dict = None,
+               full_answers: dict = None):
+    """Submit the 'Multiple account abuse' appeal.
+
+    Pass `full_answers` to send the 13-question first-appeal form; otherwise
+    the short 2-question re-appeal (yes/yes by default) is submitted."""
     url = APPEAL_URL_TMPL.format(authuser=cfg["authuser"], fsid=cfg["f_sid"])
-    data = appeal_body(cfg, customer_id, answer_changes, answer_details,
-                       tag_primary, tag_secondary, drapt=drapt)
+    if full_answers is not None:
+        data = appeal_body_full(cfg, customer_id, full_answers,
+                                tag_primary, tag_secondary, drapt=drapt)
+    else:
+        data = appeal_body(cfg, customer_id, answer_changes, answer_details,
+                           tag_primary, tag_secondary, drapt=drapt)
     r = session.post(url, headers=appeal_headers(cfg, customer_id, extras),
                      cookies=cookies, data=data, timeout=30)
     tag, details = classify(r.status_code, r.text)
